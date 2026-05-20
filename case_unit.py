@@ -26,7 +26,6 @@ class Operation:
     op_idx: int          # 0-based index within the job
     machine_type: str     # 'M1', 'M2', or 'M3'
     proc_time: float
-    operators_needed: int = 1
     no_wait_next: bool = False
 
 
@@ -69,8 +68,6 @@ MACHINES_BY_TYPE: Dict[str, List[str]] = {
 } 
 
 ALL_MACHINES: List[str] = [m for ml in MACHINES_BY_TYPE.values() for m in ml]
-
-NUM_OPERATORS: int = 3
 
 
 def compatible_machines(machine_type: str) -> List[str]:
@@ -116,20 +113,15 @@ def build_jobs() -> List[Job]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ResourceTracker:
-    """Maintains busy intervals for machines and operators."""
+    """Maintains busy intervals for machines."""
 
     def __init__(self):
         # machine -> list of (start, end) busy intervals
         self.machine_intervals: Dict[str, List[Tuple[float, float]]] = {
             m: [] for m in ALL_MACHINES}
-        # operator busy intervals  (flat list)
-        self.operator_intervals: List[Tuple[float, float]] = []
 
-    def add(self, machine: str, start: float, end: float,
-            operators: int = 1):
+    def add(self, machine: str, start: float, end: float):
         self.machine_intervals[machine].append((start, end))
-        for _ in range(operators):
-            self.operator_intervals.append((start, end))
 
     # ------------------------------------------------------------------
     # Machine
@@ -145,31 +137,6 @@ class ResourceTracker:
             if s < t + 1e-9 and e > t + 1e-9:
                 t = e
         return t
-
-    # ------------------------------------------------------------------
-    # Operators
-    # ------------------------------------------------------------------
-    def operators_free_count(self, t: float) -> int:
-        busy = sum(1 for s, e in self.operator_intervals
-                   if s < t + 1e-9 and e > t + 1e-9)
-        return NUM_OPERATORS - busy
-
-    def operators_available_throughout(self, start: float, end: float,
-                                       needed: int) -> bool:
-        """Check that at least `needed` operators are free across [start, end)."""
-        # Gather all time points where operator busy status could change
-        times = {start, end}
-        for s, e in self.operator_intervals:
-            if s < end and e > start:
-                times.add(s)
-                times.add(e)
-        times = sorted(times)
-        for i in range(len(times) - 1):
-            t_mid = (times[i] + times[i + 1]) / 2.0
-            if start <= t_mid < end:
-                if self.operators_free_count(t_mid) < needed:
-                    return False
-        return True
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constructive scheduler  (EDD priority, earliest-feasible insertion)
@@ -289,8 +256,7 @@ def schedule_jobs(
                                       start + offset, end_t)
                     schedule.append(e)
                     tracker.add(machines[i],
-                                e.start_time, e.end_time,
-                                chain_op.operators_needed)
+                                e.start_time, e.end_time)
                     scheduled_set.add((job.job_id, chain_op.op_idx))
                     offset += chain_op.proc_time
                 progress = True
@@ -309,8 +275,7 @@ def schedule_jobs(
                 e = ScheduleEntry(job.job_id, op.op_idx, m,
                                   start, start + op.proc_time)
                 schedule.append(e)
-                tracker.add(m, e.start_time, e.end_time,
-                            op.operators_needed)
+                tracker.add(m, e.start_time, e.end_time)
                 scheduled_set.add((job.job_id, op.op_idx))
                 progress = True
 
@@ -363,12 +328,8 @@ def _find_single_start(
             else:
                 cand_t = gap_start   # earliest-start heuristic
 
-            # Verify operator availability at cand_t; walk if needed
-            found_t = _seek_operator_ok(cand_t, gap_start,
-                                        gap_end - op.proc_time,
-                                        op, tracker)
-            if found_t is None:
-                continue
+            # Clamp cand_t to the feasible window
+            found_t = max(gap_start, min(cand_t, gap_end - op.proc_time))
 
             end_t = found_t + op.proc_time
             penalty = (_compute_penalty(end_t, target_end, job.alpha, job.beta)
@@ -383,40 +344,6 @@ def _find_single_start(
         return None, None
     return best_start, best_machine
 
-
-def _seek_operator_ok(
-    cand_t: float,
-    lo: float,
-    hi: float,
-    op: Operation,
-    tracker: ResourceTracker,
-    max_steps: int = 40,
-) -> Optional[float]:
-    """
-    Try to land at *cand_t* (clamped to [*lo*, *hi*]).
-    If operators are unavailable, walk forward then backward in 0.5 steps
-    looking for the nearest feasible instant inside the window.
-    """
-    cand_t = max(lo, min(cand_t, hi))
-    # Forward
-    t = cand_t
-    for _ in range(max_steps):
-        if t > hi:
-            break
-        if tracker.operators_available_throughout(t, t + op.proc_time,
-                                                   op.operators_needed):
-            return t
-        t += 0.5
-    # Backward
-    t = cand_t - 0.5
-    for _ in range(max_steps):
-        if t < lo:
-            break
-        if tracker.operators_available_throughout(t, t + op.proc_time,
-                                                   op.operators_needed):
-            return t
-        t -= 0.5
-    return None
 
 
 def _interval_free_in_tracker(
@@ -469,9 +396,7 @@ def _check_chain_feasible(
         if not _interval_free_in_tracker(m, start, end, tracker):
             return False
         offset += op.proc_time
-    total_dur = sum(op.proc_time for op in chain_ops)
-    return tracker.operators_available_throughout(t, t + total_dur,
-                                                   chain_ops[0].operators_needed)
+    return True
 
 
 def _find_no_wait_chain_start(
@@ -545,6 +470,293 @@ def _find_no_wait_chain_start(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# MILP-based scheduler (via Gurobi)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+try:
+    import gurobipy as _gp
+    _HAS_GUROBI = True
+except ImportError:
+    _HAS_GUROBI = False
+
+
+def schedule_jobs_milp(
+    jobs: List[Job],
+    fixed_entries: List[ScheduleEntry],
+    current_time: float,
+    time_limit: float = 60.0,
+) -> Optional[List[ScheduleEntry]]:
+    """
+    Build a schedule via MILP using Gurobi.
+
+    Returns None if Gurobi is not installed or the solver fails.
+    """
+    if not _HAS_GUROBI:
+        return None
+
+    fixed_keys = {(e.job_id, e.op_idx) for e in fixed_entries}
+
+    ops_to_schedule: List[Tuple[Job, Operation]] = []
+    for job in jobs:
+        for op in job.operations:
+            if (job.job_id, op.op_idx) not in fixed_keys:
+                ops_to_schedule.append((job, op))
+
+    if not ops_to_schedule:
+        return list(fixed_entries)
+
+    env = _gp.Env(params={"OutputFlag": 0})
+    model = _gp.Model("FJSP", env=env)
+    model.Params.TimeLimit = time_limit
+
+    # ── Variables ──────────────────────────────────────────────────────
+    s: Dict[Tuple[int, int], _gp.Var] = {}
+    x: Dict[Tuple[Tuple[int, int], str], _gp.Var] = {}
+
+    for job, op in ops_to_schedule:
+        key = (job.job_id, op.op_idx)
+        s[key] = model.addVar(
+            lb=max(current_time, job.release_date),
+            vtype=_gp.GRB.CONTINUOUS,
+            name=f"s_{job.job_id}_{op.op_idx}")
+        for m in compatible_machines(op.machine_type):
+            x[(key, m)] = model.addVar(
+                vtype=_gp.GRB.BINARY,
+                name=f"x_{job.job_id}_{op.op_idx}_{m}")
+
+    C: Dict[int, _gp.Var] = {}
+    E: Dict[int, _gp.Var] = {}
+    T: Dict[int, _gp.Var] = {}
+    first_start: Dict[int, _gp.Var] = {}
+    for job in jobs:
+        jid = job.job_id
+        C[jid] = model.addVar(lb=0, vtype=_gp.GRB.CONTINUOUS, name=f"C_{jid}")
+        E[jid] = model.addVar(lb=0, vtype=_gp.GRB.CONTINUOUS, name=f"E_{jid}")
+        T[jid] = model.addVar(lb=0, vtype=_gp.GRB.CONTINUOUS, name=f"T_{jid}")
+        first_start[jid] = model.addVar(lb=0, vtype=_gp.GRB.CONTINUOUS,
+                                        name=f"fs_{jid}")
+
+    # ── Constraints ────────────────────────────────────────────────────
+
+    # (1) Each operation assigned to exactly one compatible machine
+    for job, op in ops_to_schedule:
+        key = (job.job_id, op.op_idx)
+        model.addConstr(
+            _gp.quicksum(x[(key, m)]
+                         for m in compatible_machines(op.machine_type)) == 1)
+
+    # (2) Precedence within each job, including no-wait
+    for job in jobs:
+        for idx in range(len(job.operations) - 1):
+            op_cur = job.operations[idx]
+            op_next = job.operations[idx + 1]
+            key_cur = (job.job_id, op_cur.op_idx)
+            key_next = (job.job_id, op_next.op_idx)
+
+            if key_cur in fixed_keys:
+                cur_end = next(e.end_time for e in fixed_entries
+                               if e.job_id == job.job_id
+                               and e.op_idx == op_cur.op_idx)
+                if key_next in fixed_keys:
+                    continue
+                if op_cur.no_wait_next:
+                    model.addConstr(s[key_next] == cur_end)
+                else:
+                    model.addConstr(s[key_next] >= cur_end)
+            elif key_next not in fixed_keys:
+                cur_end_expr = s[key_cur] + op_cur.proc_time
+                if op_cur.no_wait_next:
+                    model.addConstr(s[key_next] == cur_end_expr)
+                else:
+                    model.addConstr(s[key_next] >= cur_end_expr)
+
+    # (3) Job completion
+    for job in jobs:
+        last_key = (job.job_id, len(job.operations) - 1)
+        if last_key in fixed_keys:
+            last_end = next(e.end_time for e in fixed_entries
+                            if e.job_id == job.job_id
+                            and e.op_idx == len(job.operations) - 1)
+            model.addConstr(C[job.job_id] == last_end)
+        else:
+            model.addConstr(
+                C[job.job_id] >= s[last_key] + job.operations[-1].proc_time)
+
+    # (4) First-start constraint
+    for job in jobs:
+        first_key = (job.job_id, 0)
+        if first_key in fixed_keys:
+            fs_val = next(e.start_time for e in fixed_entries
+                          if e.job_id == job.job_id and e.op_idx == 0)
+            model.addConstr(first_start[job.job_id] == fs_val)
+        else:
+            model.addConstr(first_start[job.job_id] == s[first_key])
+        model.addConstr(C[job.job_id] >= first_start[job.job_id])
+
+    # (5) Earliness / tardiness
+    for job in jobs:
+        jid = job.job_id
+        model.addConstr(E[jid] >= job.due_date - C[jid])
+        model.addConstr(T[jid] >= C[jid] - job.due_date)
+
+    # (6) Machine disjunction (big-M)
+    BIG_M = 10000.0
+    for m in ALL_MACHINES:
+        ops_on_m: List[Tuple[Tuple[int, int], Operation]] = []
+        for job, op in ops_to_schedule:
+            key = (job.job_id, op.op_idx)
+            if m in compatible_machines(op.machine_type):
+                ops_on_m.append((key, op))
+
+        for i in range(len(ops_on_m)):
+            for j in range(i + 1, len(ops_on_m)):
+                key_a, op_a = ops_on_m[i]
+                key_b, op_b = ops_on_m[j]
+
+                y = model.addVar(
+                    vtype=_gp.GRB.BINARY,
+                    name=f"y_{key_a[0]}_{key_a[1]}_{key_b[0]}_{key_b[1]}_{m}")
+
+                # a before b  (relaxed when not both assigned to m)
+                model.addConstr(
+                    s[key_a] + op_a.proc_time <= s[key_b]
+                    + BIG_M * (1 - y)
+                    + BIG_M * (1 - x[(key_a, m)])
+                    + BIG_M * (1 - x[(key_b, m)]))
+                # b before a
+                model.addConstr(
+                    s[key_b] + op_b.proc_time <= s[key_a]
+                    + BIG_M * y
+                    + BIG_M * (1 - x[(key_a, m)])
+                    + BIG_M * (1 - x[(key_b, m)]))
+
+    # (7) Fixed entries block their machines while still in progress
+    for e in fixed_entries:
+        if e.end_time > current_time:
+            for job, op in ops_to_schedule:
+                key = (job.job_id, op.op_idx)
+                if e.machine in compatible_machines(op.machine_type):
+                    model.addConstr(
+                        s[key] >= e.end_time
+                        - BIG_M * (1 - x[(key, e.machine)]))
+
+    # ── Objective ──────────────────────────────────────────────────────
+    model.setObjective(
+        _gp.quicksum(job.alpha * E[job.job_id] + job.beta * T[job.job_id]
+                     for job in jobs),
+        _gp.GRB.MINIMIZE)
+
+    # ── Solve ──────────────────────────────────────────────────────────
+    model.optimize()
+
+    if model.Status not in (_gp.GRB.OPTIMAL, _gp.GRB.SUBOPTIMAL,
+                            _gp.GRB.TIME_LIMIT):
+        return None
+
+    # ── Extract schedule ───────────────────────────────────────────────
+    try:
+        schedule: List[ScheduleEntry] = list(fixed_entries)
+        for job, op in ops_to_schedule:
+            key = (job.job_id, op.op_idx)
+            start_val = s[key].X
+            assigned = None
+            for m in compatible_machines(op.machine_type):
+                if x[(key, m)].X > 0.5:
+                    assigned = m
+                    break
+            if assigned is None:
+                return None
+            schedule.append(ScheduleEntry(
+                job.job_id, op.op_idx, assigned,
+                start_val, start_val + op.proc_time))
+        schedule.sort(key=lambda e: (e.start_time, e.job_id, e.op_idx))
+        return schedule
+    except Exception:
+        return None
+
+
+def validate_schedule(
+    schedule: List[ScheduleEntry],
+    jobs: List[Job],
+    current_time: float,
+    label: str = "",
+) -> List[str]:
+    """
+    Check whether *schedule* satisfies all hard constraints.
+
+    Returns a list of violation messages (empty = feasible).
+    """
+    errors: List[str] = []
+
+    # ── 1. No missing operations ───────────────────────────────────────
+    covered = {(e.job_id, e.op_idx) for e in schedule}
+    for job in jobs:
+        for op in job.operations:
+            if (job.job_id, op.op_idx) not in covered:
+                errors.append(f"[{label}] Missing: J{job.job_id}-Op{op.op_idx+1}")
+
+    # ── 2. Start-time lower bounds ─────────────────────────────────────
+    for e in schedule:
+        job = next(j for j in jobs if j.job_id == e.job_id)
+        lb = max(current_time, job.release_date)
+        if e.start_time < lb - 1e-6:
+            errors.append(
+                f"[{label}] J{e.job_id}-Op{e.op_idx+1}: "
+                f"start={e.start_time:.2f} < max(current={current_time}, "
+                f"release={job.release_date}) = {lb}")
+
+    # ── 3. Precedence & no-wait within each job ────────────────────────
+    for job in jobs:
+        sorted_ops = sorted(
+            [e for e in schedule if e.job_id == job.job_id],
+            key=lambda e: e.op_idx)
+        for k in range(len(sorted_ops) - 1):
+            e_cur = sorted_ops[k]
+            e_next = sorted_ops[k + 1]
+            if e_next.op_idx != e_cur.op_idx + 1:
+                continue  # non-consecutive, skip
+            op_cur = job.operations[e_cur.op_idx]
+            if op_cur.no_wait_next:
+                if abs(e_next.start_time - e_cur.end_time) > 1e-6:
+                    errors.append(
+                        f"[{label}] J{job.job_id}: no-wait violated between "
+                        f"Op{e_cur.op_idx+1}(end={e_cur.end_time:.2f}) and "
+                        f"Op{e_next.op_idx+1}(start={e_next.start_time:.2f})")
+            else:
+                if e_next.start_time < e_cur.end_time - 1e-6:
+                    errors.append(
+                        f"[{label}] J{job.job_id}: precedence violated: "
+                        f"Op{e_next.op_idx+1} start={e_next.start_time:.2f} "
+                        f"< Op{e_cur.op_idx+1} end={e_cur.end_time:.2f}")
+
+    # ── 4. Machine exclusivity ─────────────────────────────────────────
+    for m in ALL_MACHINES:
+        ops_on_m = sorted(
+            [e for e in schedule if e.machine == m],
+            key=lambda e: e.start_time)
+        for k in range(len(ops_on_m) - 1):
+            if ops_on_m[k].end_time > ops_on_m[k + 1].start_time + 1e-6:
+                errors.append(
+                    f"[{label}] Machine {m}: overlap J{ops_on_m[k].job_id}-"
+                    f"Op{ops_on_m[k].op_idx+1} [{ops_on_m[k].start_time:.2f},"
+                    f"{ops_on_m[k].end_time:.2f}) with J{ops_on_m[k+1].job_id}-"
+                    f"Op{ops_on_m[k+1].op_idx+1} [{ops_on_m[k+1].start_time:.2f},"
+                    f"{ops_on_m[k+1].end_time:.2f})")
+
+    # ── 5. Machine compatibility ───────────────────────────────────────
+    for e in schedule:
+        job = next(j for j in jobs if j.job_id == e.job_id)
+        op = job.operations[e.op_idx]
+        compat = compatible_machines(op.machine_type)
+        if e.machine not in compat:
+            errors.append(
+                f"[{label}] J{e.job_id}-Op{e.op_idx+1}: assigned to "
+                f"{e.machine}, not in {compat} (type {op.machine_type})")
+
+    return errors
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Simulation engine
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -577,6 +789,41 @@ def simulate() -> Tuple[List[ScheduleEntry], List[ScheduleEntry]]:
     # ── Stage 2: t = 24 ─────────────────────────────────────────────────
     visible_jobs_t24 = [j for j in all_jobs if j.arrival_time <= 24]
     updated_schedule = schedule_jobs(visible_jobs_t24, fixed_at_t24, 24.0)
+
+    return initial_schedule, updated_schedule
+
+
+def simulate_milp(
+    time_limit: float = 60.0,
+) -> Tuple[Optional[List[ScheduleEntry]], Optional[List[ScheduleEntry]]]:
+    """
+    Run the two-stage simulation using MILP (Gurobi).
+
+    Returns (None, None) if Gurobi is not available.
+    """
+    all_jobs = build_jobs()
+
+    # ── Stage 1: t = 0 ──────────────────────────────────────────────────
+    visible_jobs_t0 = [j for j in all_jobs if j.arrival_time <= 0]
+    initial_schedule = schedule_jobs_milp(visible_jobs_t0, [], 0.0, time_limit)
+    if initial_schedule is None:
+        return None, None
+
+    # ── Determine frozen operations at t=24 ─────────────────────────────
+    fixed_at_t24: List[ScheduleEntry] = []
+    for e in initial_schedule:
+        if e.start_time < 24:
+            e_fixed = ScheduleEntry(e.job_id, e.op_idx, e.machine,
+                                    e.start_time, e.end_time,
+                                    fixed=True)
+            fixed_at_t24.append(e_fixed)
+
+    # ── Stage 2: t = 24 ─────────────────────────────────────────────────
+    visible_jobs_t24 = [j for j in all_jobs if j.arrival_time <= 24]
+    updated_schedule = schedule_jobs_milp(visible_jobs_t24, fixed_at_t24,
+                                          24.0, time_limit)
+    if updated_schedule is None:
+        return None, None
 
     return initial_schedule, updated_schedule
 
@@ -737,52 +984,163 @@ def main():
     print("=" * 72)
     print("  Pharmaceutical FJSP Rescheduling Simulation — Example 1")
     print("=" * 72)
-    print(f"  Resources: 4 machines (M1×2, M2×1, M3×1) | {NUM_OPERATORS} operators")
+    print(f"  Resources: 4 machines (M1×2, M2×1, M3×1)")
 
-    initial_schedule, updated_schedule = simulate()
     all_jobs = build_jobs()
+    jobs_t0 = [j for j in all_jobs if j.arrival_time <= 0]
+    jobs_t24 = [j for j in all_jobs if j.arrival_time <= 24]
 
-    # ── Console output ──────────────────────────────────────────────────
-    print_schedule(initial_schedule, "Initial Schedule (t = 0)")
-    print_metrics(initial_schedule,
-                  [j for j in all_jobs if j.arrival_time <= 0],
-                  "Initial")
+    # ── Method 1: Greedy EDD heuristic ───────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  METHOD 1: Greedy EDD Heuristic")
+    print("=" * 72)
+    initial_greedy, updated_greedy = simulate()
 
-    print_schedule(updated_schedule, "Updated Schedule (t = 24, J₄ arrived)")
-    print_metrics(updated_schedule,
-                  [j for j in all_jobs if j.arrival_time <= 24],
-                  "Updated")
+    print_schedule(initial_greedy, "Initial Schedule (t = 0)")
+    print_metrics(initial_greedy, jobs_t0, "Initial (Greedy)")
+    print_schedule(updated_greedy, "Updated Schedule (t = 24, J₄ arrived)")
+    print_metrics(updated_greedy, jobs_t24, "Updated (Greedy)")
 
-    # Describe frozen operations at t=24
+    # Frozen operations at t=24
     print(f"\n  ── Operations frozen at t=24 ──")
-    frozen = [e for e in updated_schedule if e.fixed]
+    frozen = [e for e in updated_greedy if e.fixed]
     for e in frozen:
         print(f"    J{e.job_id}-Op{e.op_idx + 1}  on {e.machine}  "
               f"[{e.start_time:.1f} → {e.end_time:.1f}]")
 
-    # ── Gantt charts ────────────────────────────────────────────────────
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 9))
+    # ── Method 2: MILP (Gurobi) ──────────────────────────────────────────
+    initial_milp, updated_milp = simulate_milp()
 
-    t0_max = max(e.end_time for e in initial_schedule) * 1.08
-    t24_max = max(e.end_time for e in updated_schedule) * 1.08
-    x_max = max(t0_max, t24_max)
+    if initial_milp is not None and updated_milp is not None:
+        print("\n" + "=" * 72)
+        print("  METHOD 2: MILP (Gurobi)")
+        print("=" * 72)
+        print_schedule(initial_milp, "Initial Schedule (t = 0)")
+        print_metrics(initial_milp, jobs_t0, "Initial (MILP)")
+        print_schedule(updated_milp, "Updated Schedule (t = 24, J₄ arrived)")
+        print_metrics(updated_milp, jobs_t24, "Updated (MILP)")
 
-    plot_gantt(initial_schedule,
-               'Initial Schedule  (t = 0)  —  J₁, J₂, J₃',
-               ax=ax1)
-    ax1.set_xlim(0, x_max)
+        # ── Side-by-side comparison ────────────────────────────────────
+        m_greedy_init = compute_metrics(initial_greedy, jobs_t0)
+        m_greedy_upd  = compute_metrics(updated_greedy, jobs_t24)
+        m_milp_init   = compute_metrics(initial_milp, jobs_t0)
+        m_milp_upd    = compute_metrics(updated_milp, jobs_t24)
 
-    plot_gantt(updated_schedule,
-               'Updated Schedule  (t = 24, J₄ arrives)  —  hatched = frozen',
-               current_time=24,
-               ax=ax2)
-    ax2.set_xlim(0, x_max)
+        print(f"\n{'─' * 72}")
+        print(f"  Comparison: Greedy vs MILP")
+        print(f"{'─' * 72}")
+        hdr = (f"  {'Stage':<8s} {'Metric':<22s} "
+               f"{'Greedy':>10s}  {'MILP':>10s}  {'Gap':>10s}")
+        print(hdr)
+        print(f"  {'─' * len(hdr)}")
 
-    fig.tight_layout(pad=3.0)
-    plt.savefig('gantt_charts_unit.png', dpi=150, bbox_inches='tight')
-    plt.show()
+        for label, gm, mm in [("t=0", m_greedy_init, m_milp_init),
+                              ("t=24", m_greedy_upd, m_milp_upd)]:
+            for mname, key in [("Total Penalty", "total_penalty"),
+                               ("Active Lead Time", "total_active_lead_time")]:
+                gv = gm[key]
+                mv = mm[key]
+                gap = gv - mv
+                print(f"  {label:<8s} {mname:<22s} "
+                      f"{gv:>10.1f}  {mv:>10.1f}  {gap:>+10.1f}")
 
-    print(f"\n  Gantt charts saved to 'gantt_charts_unit.png'")
+        # ── Per-job penalty breakdown ──────────────────────────────────
+        print(f"\n{'─' * 72}")
+        print(f"  Per-Job Penalty Breakdown  (αⱼEⱼ + βⱼTⱼ)")
+        print(f"{'─' * 72}")
+        jhdr = (f"  {'Job':>6s} {'dⱼ':>6s} {'αⱼ':>4s} {'βⱼ':>4s} "
+                f"{'Greedy Cⱼ':>10s} {'MILP Cⱼ':>10s} "
+                f"{'G-Pen':>10s} {'M-Pen':>10s} {'ΔPen':>10s}")
+        print(jhdr)
+        print(f"  {'─' * len(jhdr)}")
+        for jid in sorted(set(j.job_id for j in jobs_t24)):
+            job = next(j for j in jobs_t24 if j.job_id == jid)
+            gC = m_greedy_upd['completion'].get(jid, 0)
+            mC = m_milp_upd['completion'].get(jid, 0)
+            gE = max(0, job.due_date - gC)
+            gT = max(0, gC - job.due_date)
+            mE = max(0, job.due_date - mC)
+            mT = max(0, mC - job.due_date)
+            gPen = job.alpha * gE + job.beta * gT
+            mPen = job.alpha * mE + job.beta * mT
+            print(f"  {'J'+str(jid):>6s} {job.due_date:>6.0f} "
+                  f"{job.alpha:>4.0f} {job.beta:>4.0f} "
+                  f"{gC:>10.1f} {mC:>10.1f} "
+                  f"{gPen:>10.1f} {mPen:>10.1f} "
+                  f"{gPen - mPen:>+10.1f}")
+
+        # ── Constraint validation ──────────────────────────────────────
+        print(f"\n{'─' * 72}")
+        print(f"  Constraint Validation")
+        print(f"{'─' * 72}")
+        all_ok = True
+        for sched, lbl in [(initial_greedy, "Greedy-t0"),
+                           (updated_greedy, "Greedy-t24"),
+                           (initial_milp, "MILP-t0"),
+                           (updated_milp, "MILP-t24")]:
+            jlist = jobs_t0 if "t0" in lbl else jobs_t24
+            ct = 0.0 if "t0" in lbl else 24.0
+            errs = validate_schedule(sched, jlist, ct, lbl)
+            if errs:
+                all_ok = False
+                for err in errs:
+                    print(f"  ✗ {err}")
+            else:
+                print(f"  ✓ {lbl}: all constraints satisfied")
+
+        if not all_ok:
+            print(f"\n  WARNING: constraint violations detected above.")
+
+        # ── Comparison Gantt chart ─────────────────────────────────────
+        fig, axes = plt.subplots(2, 2, figsize=(18, 10))
+
+        t0_max = max(max(e.end_time for e in initial_greedy),
+                     max(e.end_time for e in initial_milp)) * 1.08
+        t24_max = max(max(e.end_time for e in updated_greedy),
+                      max(e.end_time for e in updated_milp)) * 1.08
+        x_max = max(t0_max, t24_max)
+
+        plot_gantt(initial_greedy, 'Greedy  —  Initial (t=0)', ax=axes[0, 0])
+        axes[0, 0].set_xlim(0, x_max)
+        plot_gantt(initial_milp, 'MILP  —  Initial (t=0)', ax=axes[0, 1])
+        axes[0, 1].set_xlim(0, x_max)
+
+        plot_gantt(updated_greedy,
+                   'Greedy  —  Updated (t=24)  (hatched = frozen)',
+                   current_time=24, ax=axes[1, 0])
+        axes[1, 0].set_xlim(0, x_max)
+        plot_gantt(updated_milp,
+                   'MILP  —  Updated (t=24)  (hatched = frozen)',
+                   current_time=24, ax=axes[1, 1])
+        axes[1, 1].set_xlim(0, x_max)
+
+        fig.tight_layout(pad=4.0)
+        plt.savefig('gantt_charts_unit.png', dpi=150, bbox_inches='tight')
+        plt.show()
+        print(f"\n  Gantt charts saved to 'gantt_charts_unit.png'")
+
+    else:
+        # Gurobi not available — fallback to greedy-only display
+        print("\n  [Gurobi not available — showing greedy results only]\n")
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 9))
+        t0_max = max(e.end_time for e in initial_greedy) * 1.08
+        t24_max = max(e.end_time for e in updated_greedy) * 1.08
+        x_max = max(t0_max, t24_max)
+
+        plot_gantt(initial_greedy,
+                   'Initial Schedule  (t = 0)  —  J₁, J₂, J₃',
+                   ax=ax1)
+        ax1.set_xlim(0, x_max)
+        plot_gantt(updated_greedy,
+                   'Updated Schedule  (t = 24, J₄ arrives)  —  hatched = frozen',
+                   current_time=24, ax=ax2)
+        ax2.set_xlim(0, x_max)
+
+        fig.tight_layout(pad=3.0)
+        plt.savefig('gantt_charts_unit.png', dpi=150, bbox_inches='tight')
+        plt.show()
+        print(f"\n  Gantt charts saved to 'gantt_charts_unit.png'")
 
 
 if __name__ == '__main__':
