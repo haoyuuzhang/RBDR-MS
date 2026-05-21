@@ -5,15 +5,15 @@ Based on the three-layer model from hierarchical_modeling.md
 Three-layer architecture:
   Shop Level         : assigns operations -> service units
   Service Unit Level : schedules operations on machines within each unit
-  Machine Level      : executes production (no disturbances in this case)
+  Machine Level      : executes production
 
-Two-stage simulation:
-  t=0  : Gurobi MILP computes optimal initial schedule for J1, J2, J3
-  t=24 : J4 arrives -> hierarchical reschedule with frozen ops
+Simulation scenarios:
+  Dynamic Arrival    : t=0 initial schedule, t=24 J4 arrives -> reschedule
+  Experiment 1       : Urgent order J5 insertion at t=24
+  Experiment 2       : Machine M1_U2 disruption at t=60 (continues from Exp 1)
 """
 
 from dataclasses import dataclass
-from itertools import product
 from typing import List, Dict, Optional, Tuple
 import matplotlib
 matplotlib.use('Agg')
@@ -98,7 +98,7 @@ def build_jobs() -> List[Job]:
       J4         : Op1->M3, Op2->M1, Op3->M2   (sequence 3-1-2)
     """
     return [
-        Job(job_id=1, release_date=0, due_date=96, alpha=0, beta=1,
+        Job(job_id=1, release_date=0, due_date=40, alpha=0, beta=1,
             arrival_time=0, operations=[
                 Operation(1, 0, 'M1', {'U1': 10, 'U2': 14}),
                 Operation(1, 1, 'M2', {'U1': 12, 'U2': 16}),
@@ -108,221 +108,21 @@ def build_jobs() -> List[Job]:
             arrival_time=0, operations=[
                 Operation(2, 0, 'M1', {'U1': 18, 'U2': 14}),
                 Operation(2, 1, 'M2', {'U1': 30, 'U2': 22}),
-                Operation(2, 2, 'M1', {'U1': 25, 'U2': 20}),
+                Operation(2, 2, 'M1', {'U1': 15, 'U2': 20}),
             ]),
-        Job(job_id=3, release_date=0, due_date=120, alpha=1, beta=2,
+        Job(job_id=3, release_date=0, due_date=80, alpha=1, beta=2,
             arrival_time=0, operations=[
-                Operation(3, 0, 'M1', {'U1': 16, 'U2': 12}),
-                Operation(3, 1, 'M2', {'U1': 16, 'U2': 12}),
-                Operation(3, 2, 'M1', {'U1': 24, 'U2': 18}),
+                Operation(3, 0, 'M1', {'U1': 24, 'U2': 18}),
+                Operation(3, 1, 'M2', {'U1': 24, 'U2': 28}),
+                Operation(3, 2, 'M1', {'U1': 16, 'U2': 12}),
             ]),
         Job(job_id=4, release_date=48, due_date=96, alpha=1, beta=6,
             arrival_time=24, operations=[
                 Operation(4, 0, 'M3', {'U1': 12}),
-                Operation(4, 1, 'M1', {'U1': 12, 'U2': 18}),
-                Operation(4, 2, 'M2', {'U1': 24, 'U2': 18}),
+                Operation(4, 1, 'M1', {'U1': 20, 'U2': 12}),
+                Operation(4, 2, 'M2', {'U1': 16, 'U2': 18}),
             ]),
     ]
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Shop-level: operation -> service unit assignment (load balancing)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def shop_level_assignment(
-    ops_to_assign: List[Tuple[Job, Operation]],
-    fixed_entries: List[ScheduleEntry],
-) -> Dict[Tuple[int, int], str]:
-    """
-    Greedy load-balanced assignment of operations to service units.
-
-    Objective: min max_u (sum X_{i,j,u} * P_{i,j,u}) / m_u
-    """
-    unit_load: Dict[str, float] = {u: 0.0 for u in SERVICE_UNITS}
-    for e in fixed_entries:
-        unit_load[e.service_unit] += e.duration
-
-    assignment: Dict[Tuple[int, int], str] = {}
-    for e in fixed_entries:
-        assignment[(e.job_id, e.op_idx)] = e.service_unit
-
-    sorted_ops = sorted(ops_to_assign, key=lambda x: (
-        x[0].due_date, x[0].job_id, x[1].op_idx))
-
-    for job, op in sorted_ops:
-        feasible_units = list(op.unit_times.keys())
-        if not feasible_units:
-            continue
-
-        best_unit = None
-        best_intensity = float('inf')
-        for u in feasible_units:
-            new_load = unit_load[u] + op.unit_times[u]
-            intensity = new_load / len(SERVICE_UNITS[u])
-            if intensity < best_intensity:
-                best_intensity = intensity
-                best_unit = u
-
-        if best_unit is not None:
-            assignment[(job.job_id, op.op_idx)] = best_unit
-            unit_load[best_unit] += op.unit_times[best_unit]
-
-    return assignment
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Resource tracker (for greedy scheduler)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class ResourceTracker:
-    def __init__(self):
-        self.machine_intervals: Dict[str, List[Tuple[float, float]]] = {
-            m: [] for m in ALL_MACHINES}
-
-    def add(self, machine: str, start: float, end: float):
-        self.machine_intervals[machine].append((start, end))
-
-    def machine_next_free(self, machine: str, t: float) -> float:
-        intervals = sorted(self.machine_intervals[machine])
-        for s, e in intervals:
-            if s < t + 1e-9 and e > t + 1e-9:
-                t = e
-        return t
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Unit-level greedy scheduler
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _compute_penalty(end_time: float, due_date: float,
-                     alpha: float, beta: float) -> float:
-    if end_time <= due_date:
-        return alpha * (due_date - end_time)
-    else:
-        return beta * (end_time - due_date)
-
-
-def schedule_operations(
-    jobs: List[Job],
-    fixed_entries: List[ScheduleEntry],
-    current_time: float,
-    unit_assignment: Dict[Tuple[int, int], str],
-) -> List[ScheduleEntry]:
-    """Greedy EDD scheduling within assigned service units."""
-    tracker = ResourceTracker()
-    for e in fixed_entries:
-        tracker.add(e.machine, e.start_time, e.end_time)
-
-    schedule: List[ScheduleEntry] = list(fixed_entries)
-    fixed_set = {(e.job_id, e.op_idx) for e in fixed_entries}
-
-    unscheduled: List[Tuple[Job, Operation]] = []
-    for job in jobs:
-        for op in job.operations:
-            if (job.job_id, op.op_idx) not in fixed_set:
-                unscheduled.append((job, op))
-
-    unscheduled.sort(key=lambda x: (x[0].due_date, x[0].job_id, x[1].op_idx))
-
-    scheduled_set: set = fixed_set.copy()
-
-    while unscheduled:
-        progress = False
-        remaining: List[Tuple[Job, Operation]] = []
-
-        for job, op in unscheduled:
-            if op.op_idx > 0:
-                prev_key = (job.job_id, op.op_idx - 1)
-                if prev_key not in scheduled_set:
-                    remaining.append((job, op))
-                    continue
-
-            prev_end = job.release_date
-            prev_unit = None
-            if op.op_idx > 0:
-                for e in schedule:
-                    if e.job_id == job.job_id and e.op_idx == op.op_idx - 1:
-                        prev_end = e.end_time
-                        prev_unit = e.service_unit
-                        break
-
-            assigned_unit = unit_assignment.get((job.job_id, op.op_idx))
-            if assigned_unit is None:
-                remaining.append((job, op))
-                continue
-
-            transport = TRANSPORT_TIME if (
-                prev_unit is not None and prev_unit != assigned_unit) else 0.0
-
-            candidate_machines = [
-                m for m in SERVICE_UNITS[assigned_unit]
-                if machine_type_of(m) == op.machine_type
-            ]
-
-            if not candidate_machines:
-                remaining.append((job, op))
-                continue
-
-            t0 = max(prev_end + transport, current_time, job.release_date)
-
-            target_end: Optional[float] = None
-            if job.alpha > 0 and op.op_idx == len(job.operations) - 1:
-                target_end = job.due_date
-
-            best_start = float('inf')
-            best_penalty = float('inf')
-            best_machine = None
-
-            for m in candidate_machines:
-                start = max(t0, tracker.machine_next_free(m, t0))
-                end_t = start + op.unit_times[assigned_unit]
-                penalty = (_compute_penalty(end_t, target_end or end_t,
-                                            job.alpha, job.beta)
-                           if target_end is not None else start)
-
-                if penalty < best_penalty - 1e-9:
-                    best_penalty = penalty
-                    best_start = start
-                    best_machine = m
-
-            if best_machine is None:
-                remaining.append((job, op))
-                continue
-
-            end_t = best_start + op.unit_times[assigned_unit]
-            e = ScheduleEntry(job.job_id, op.op_idx, best_machine,
-                              assigned_unit, best_start, end_t)
-            schedule.append(e)
-            tracker.add(best_machine, e.start_time, e.end_time)
-            scheduled_set.add((job.job_id, op.op_idx))
-            progress = True
-
-        if not progress:
-            break
-        unscheduled = remaining
-
-    schedule.sort(key=lambda e: (e.start_time, e.job_id, e.op_idx))
-    return schedule
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Hierarchical scheduler (greedy)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def hierarchical_schedule(
-    jobs: List[Job],
-    fixed_entries: List[ScheduleEntry],
-    current_time: float,
-) -> List[ScheduleEntry]:
-    fixed_set = {(e.job_id, e.op_idx) for e in fixed_entries}
-    ops_to_assign: List[Tuple[Job, Operation]] = []
-    for job in jobs:
-        for op in job.operations:
-            if (job.job_id, op.op_idx) not in fixed_set:
-                ops_to_assign.append((job, op))
-
-    unit_assignment = shop_level_assignment(ops_to_assign, fixed_entries)
-    return schedule_operations(jobs, fixed_entries, current_time, unit_assignment)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -336,11 +136,22 @@ except ImportError:
     _HAS_GUROBI = False
 
 
+def _get_effective_time(op: Operation, unit_name: str,
+                       time_factors: Optional[Dict[str, float]] = None) -> float:
+    """Return processing time scaled by time_factors if applicable."""
+    base = op.unit_times.get(unit_name, 0.0)
+    if time_factors:
+        machine = f"{op.machine_type}_{unit_name}"
+        return base * time_factors.get(machine, 1.0)
+    return base
+
+
 def schedule_milp(
     jobs: List[Job],
     fixed_entries: List[ScheduleEntry],
     current_time: float,
     time_limit: float = 60.0,
+    time_factors: Optional[Dict[str, float]] = None,
 ) -> Optional[List[ScheduleEntry]]:
     """
     MILP that jointly optimizes unit assignment and machine scheduling.
@@ -351,6 +162,9 @@ def schedule_milp(
       y[(a,b), unit]   : sequencing on shared machine in unit
 
     Objective: minimize total weighted earliness-tardiness penalty.
+
+    time_factors: optional dict mapping machine_name -> multiplier for disrupted
+                  processing times (e.g. {'M1_U2': 2.0})
     """
     if not _HAS_GUROBI:
         return None
@@ -483,7 +297,8 @@ def schedule_milp(
                                 name=f"prec_{job.job_id}_{idx}_fixed")
             elif key_next in fixed_keys:
                 cur_dur_expr = _gp.quicksum(
-                    u[(key_cur[0], key_cur[1], unit_name)] * op_cur.unit_times[unit_name]
+                    u[(key_cur[0], key_cur[1], unit_name)] *
+                    _get_effective_time(op_cur, unit_name, time_factors)
                     for unit_name in op_cur.unit_times)
                 next_start_fixed = next(e.start_time for e in fixed_entries
                                         if e.job_id == job.job_id
@@ -492,7 +307,8 @@ def schedule_milp(
                                 name=f"prec_{job.job_id}_{idx}_to_fixed")
             else:
                 cur_dur_expr = _gp.quicksum(
-                    u[(key_cur[0], key_cur[1], unit_name)] * op_cur.unit_times[unit_name]
+                    u[(key_cur[0], key_cur[1], unit_name)] *
+                    _get_effective_time(op_cur, unit_name, time_factors)
                     for unit_name in op_cur.unit_times)
 
                 # Transport time: 0 if same unit, LT if different
@@ -519,7 +335,8 @@ def schedule_milp(
         else:
             last_op = job.operations[-1]
             last_dur = _gp.quicksum(
-                u[(last_key[0], last_key[1], unit_name)] * last_op.unit_times[unit_name]
+                u[(last_key[0], last_key[1], unit_name)] *
+                _get_effective_time(last_op, unit_name, time_factors)
                 for unit_name in last_op.unit_times)
             model.addConstr(C[job.job_id] >= s[last_key] + last_dur,
                             name=f"comp_{job.job_id}")
@@ -536,10 +353,12 @@ def schedule_milp(
             for j in range(i + 1, len(op_list)):
                 a_key, b_key = op_list[i], op_list[j]
                 a_dur_expr = _gp.quicksum(
-                    u[(a_key[0], a_key[1], un)] * _get_op_time(jobs, a_key, un)
+                    u[(a_key[0], a_key[1], un)] *
+                    _get_op_time(jobs, a_key, un, time_factors)
                     for un in _get_op_feasible_units(jobs, a_key))
                 b_dur_expr = _gp.quicksum(
-                    u[(b_key[0], b_key[1], un)] * _get_op_time(jobs, b_key, un)
+                    u[(b_key[0], b_key[1], un)] *
+                    _get_op_time(jobs, b_key, un, time_factors)
                     for un in _get_op_feasible_units(jobs, b_key))
 
                 yk = (a_key[0], a_key[1], b_key[0], b_key[1], unit_name)
@@ -598,7 +417,7 @@ def schedule_milp(
             if assigned_unit is None:
                 return None
             machine = f"{op.machine_type}_{assigned_unit}"
-            proc_time = op.unit_times[assigned_unit]
+            proc_time = _get_effective_time(op, assigned_unit, time_factors)
             schedule.append(ScheduleEntry(
                 job.job_id, op.op_idx, machine, assigned_unit,
                 start_val, start_val + proc_time))
@@ -608,12 +427,17 @@ def schedule_milp(
         return None
 
 
-def _get_op_time(jobs: List[Job], key: Tuple[int, int], unit_name: str) -> float:
-    """Get processing time of an operation on a given unit."""
+def _get_op_time(jobs: List[Job], key: Tuple[int, int], unit_name: str,
+                 time_factors: Optional[Dict[str, float]] = None) -> float:
+    """Get effective processing time of an operation on a given unit."""
     for job in jobs:
         if job.job_id == key[0]:
             op = job.operations[key[1]]
-            return op.unit_times.get(unit_name, 0.0)
+            base = op.unit_times.get(unit_name, 0.0)
+            if time_factors:
+                machine = f"{op.machine_type}_{unit_name}"
+                return base * time_factors.get(machine, 1.0)
+            return base
     return 0.0
 
 
@@ -677,6 +501,7 @@ JOB_LABELS = {
     2: 'J2',
     3: 'J3',
     4: 'J4',
+    5: 'J5',
 }
 
 
@@ -760,7 +585,7 @@ def print_schedule(schedule: List[ScheduleEntry], title: str):
     print(f"  {'Job':>6s}  {'Op':>4s}  {'Machine':>10s}  {'Unit':>5s}  "
           f"{'Start':>8s}  {'End':>8s}  {'Dur':>6s}  {'Status':>10s}")
     print(f"  {'-' * 80}")
-    for e in schedule:
+    for e in sorted(schedule, key=lambda e: (e.job_id, e.op_idx)):
         status = 'FIXED' if e.fixed else 'planned'
         print(f"  {'J' + str(e.job_id):>6s}  {e.op_idx + 1:>4d}  "
               f"{e.machine:>10s}  {e.service_unit:>5s}  "
@@ -783,126 +608,32 @@ def print_metrics(schedule: List[ScheduleEntry], jobs: List[Job], label: str):
     print(f"  Total weighted penalty : {metrics['total_penalty']:.1f}")
     print(f"  Total active lead time : {metrics['total_active_lead_time']:.1f}")
 
-    unit_loads: Dict[str, float] = {}
-    for e in schedule:
-        unit_loads[e.service_unit] = unit_loads.get(e.service_unit, 0) + e.duration
-    print(f"\n  -- Service Unit Load Summary --")
-    for u in ['U1', 'U2']:
-        load = unit_loads.get(u, 0)
-        n_machines = len(SERVICE_UNITS[u])
-        print(f"    {u}: total load = {load:.1f},  "
-              f"avg load/machine = {load / n_machines:.1f}  "
-              f"({n_machines} machines)")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Validation
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def validate_schedule(schedule: List[ScheduleEntry], jobs: List[Job],
-                      current_time: float, label: str = "") -> List[str]:
-    errors: List[str] = []
-
-    covered = {(e.job_id, e.op_idx) for e in schedule}
-    for job in jobs:
-        for op in job.operations:
-            if (job.job_id, op.op_idx) not in covered:
-                errors.append(f"[{label}] Missing: J{job.job_id}-Op{op.op_idx + 1}")
-
-    for e in schedule:
-        if e.fixed:
-            continue
-        job = next(j for j in jobs if j.job_id == e.job_id)
-        lb = max(current_time, job.release_date)
-        if e.start_time < lb - 1e-6:
-            errors.append(
-                f"[{label}] J{e.job_id}-Op{e.op_idx + 1}: "
-                f"start={e.start_time:.2f} < max(current={current_time}, "
-                f"release={job.release_date}) = {lb}")
-
-    for job in jobs:
-        sorted_ops = sorted(
-            [e for e in schedule if e.job_id == job.job_id],
-            key=lambda e: e.op_idx)
-        for k in range(len(sorted_ops) - 1):
-            e_cur = sorted_ops[k]
-            e_next = sorted_ops[k + 1]
-            if e_next.op_idx != e_cur.op_idx + 1:
-                continue
-            if e_next.start_time < e_cur.end_time - 1e-6:
-                errors.append(
-                    f"[{label}] J{job.job_id}: precedence violated: "
-                    f"Op{e_next.op_idx + 1} start={e_next.start_time:.2f} "
-                    f"< Op{e_cur.op_idx + 1} end={e_cur.end_time:.2f}")
-
-    for m in ALL_MACHINES:
-        ops_on_m = sorted(
-            [e for e in schedule if e.machine == m],
-            key=lambda e: e.start_time)
-        for k in range(len(ops_on_m) - 1):
-            if ops_on_m[k].end_time > ops_on_m[k + 1].start_time + 1e-6:
-                errors.append(
-                    f"[{label}] Machine {m}: overlap "
-                    f"J{ops_on_m[k].job_id}-Op{ops_on_m[k].op_idx + 1} "
-                    f"with J{ops_on_m[k + 1].job_id}-Op{ops_on_m[k + 1].op_idx + 1}")
-
-    for e in schedule:
-        job = next(j for j in jobs if j.job_id == e.job_id)
-        op = job.operations[e.op_idx]
-        if e.service_unit not in op.unit_times:
-            errors.append(
-                f"[{label}] J{e.job_id}-Op{e.op_idx + 1}: unit "
-                f"{e.service_unit} not feasible")
-        expected_type = op.machine_type
-        actual_type = machine_type_of(e.machine)
-        if expected_type != actual_type:
-            errors.append(
-                f"[{label}] J{e.job_id}-Op{e.op_idx + 1}: machine type "
-                f"mismatch, expected {expected_type}, got {actual_type}")
-        if e.machine not in SERVICE_UNITS.get(e.service_unit, []):
-            errors.append(
-                f"[{label}] J{e.job_id}-Op{e.op_idx + 1}: machine "
-                f"{e.machine} not in unit {e.service_unit}")
-
-    return errors
+    # unit_loads: Dict[str, float] = {}
+    # for e in schedule:
+    #     unit_loads[e.service_unit] = unit_loads.get(e.service_unit, 0) + e.duration
+    # print(f"\n  -- Service Unit Load Summary --")
+    # for u in ['U1', 'U2']:
+    #     load = unit_loads.get(u, 0)
+    #     n_machines = len(SERVICE_UNITS[u])
+    #     print(f"    {u}: total load = {load:.1f},  "
+    #           f"avg load/machine = {load / n_machines:.1f}  "
+    #           f"({n_machines} machines)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Simulation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def simulate_greedy() -> Tuple[List[ScheduleEntry], List[ScheduleEntry]]:
-    """Two-stage simulation using greedy hierarchical scheduler."""
-    all_jobs = build_jobs()
-
-    visible_jobs_t0 = [j for j in all_jobs if j.arrival_time <= 0]
-    initial_schedule = hierarchical_schedule(visible_jobs_t0, [], 0.0)
-
-    fixed_at_t24: List[ScheduleEntry] = []
-    for e in initial_schedule:
-        if e.start_time < 24:
-            e_fixed = ScheduleEntry(e.job_id, e.op_idx, e.machine,
-                                    e.service_unit,
-                                    e.start_time, e.end_time, fixed=True)
-            fixed_at_t24.append(e_fixed)
-
-    visible_jobs_t24 = [j for j in all_jobs if j.arrival_time <= 24]
-    updated_schedule = hierarchical_schedule(visible_jobs_t24, fixed_at_t24, 24.0)
-
-    return initial_schedule, updated_schedule
-
-
-def simulate_milp(
+def simulate_dynamic_arrival(
+    all_jobs: List[Job],
     time_limit: float = 60.0,
 ) -> Tuple[Optional[List[ScheduleEntry]], Optional[List[ScheduleEntry]]]:
     """
-    Two-stage simulation using MILP.
+    Two-stage dynamic-arrival simulation using MILP.
 
-    t=0 : MILP optimal initial schedule
-    t=24: MILP re-optimization with frozen ops
+    t=0  : MILP optimal initial schedule for visible jobs
+    t=24 : J4 arrives -> MILP re-optimization with frozen ops
     """
-    all_jobs = build_jobs()
-
     # t=0 MILP
     visible_jobs_t0 = [j for j in all_jobs if j.arrival_time <= 0]
     initial_schedule = schedule_milp(visible_jobs_t0, [], 0.0, time_limit)
@@ -929,179 +660,126 @@ def simulate_milp(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Experiment 2: Machine Processing-Time Disruption
+#   (continues from simulate_dynamic_arrival, which serves as Experiment 1)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def experiment2_machine_disruption(
+    all_jobs: List[Job],
+    previous_schedule: List[ScheduleEntry],
+    disruption_time: float = 60.0,
+    disrupted_machine: str = 'M1_U2',
+    factor: float = 2.0,
+    time_limit: float = 60.0,
+) -> Optional[List[ScheduleEntry]]:
+    """
+    Exp 2: Machine disruption at t=disruption_time (continues from Exp 1).
+
+    The disrupted_machine's processing time is multiplied by ``factor``.
+    - Completed ops (end <= disruption_time): kept as-is
+    - Mid-processing ops (start < disruption_time < end): remaining time scaled
+    - Not-yet-started ops: rescheduled with updated time factors
+    """
+    fixed_entries: List[ScheduleEntry] = []
+
+    for e in previous_schedule:
+        if e.end_time <= disruption_time:
+            # Already completed
+            fixed_entries.append(ScheduleEntry(
+                e.job_id, e.op_idx, e.machine, e.service_unit,
+                e.start_time, e.end_time, fixed=True))
+        elif e.start_time < disruption_time:
+            # Mid-processing — extend remaining time if on disrupted machine
+            if e.machine == disrupted_machine:
+                remaining = (e.end_time - disruption_time) * factor
+                new_end = disruption_time + remaining
+            else:
+                new_end = e.end_time
+            fixed_entries.append(ScheduleEntry(
+                e.job_id, e.op_idx, e.machine, e.service_unit,
+                e.start_time, new_end, fixed=True))
+        # else: not yet started — will be rescheduled
+
+    time_factors = {disrupted_machine: factor}
+    schedule = schedule_milp(all_jobs, fixed_entries, disruption_time,
+                             time_limit, time_factors=time_factors)
+    return schedule
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    print("=" * 80)
-    print("  Hierarchical FJSP Rescheduling Simulation")
-    print("  Three-Layer Model: Shop -> Service Unit -> Machine")
-    print("=" * 80)
-    print(f"  Service Units: U1 (M1_U1, M2_U1, M3_U1) | "
-          f"U2 (M1_U2, M2_U2)")
-    print(f"  Jobs: J1, J2, J3 (t=0)  |  J4 arrives at t=24, released at t=48")
-    print(f"  Machine sequences: J1,J2,J3: M1->M2->M1  |  J4: M3->M1->M2")
-
     all_jobs = build_jobs()
     jobs_t0 = [j for j in all_jobs if j.arrival_time <= 0]
     jobs_t24 = [j for j in all_jobs if j.arrival_time <= 24]
 
-    # ── Greedy baseline ──────────────────────────────────────────────────
+    # ═════════════════════════════════════════════════════════════════════
+    # Experiment 1: Urgent Order Insertion (J4 arrives at t=24)
+    # ═════════════════════════════════════════════════════════════════════
     print("\n" + "=" * 80)
-    print("  METHOD 1: Greedy Hierarchical (Load Balancing + EDD)")
+    print("  Experiment 1: Urgent Order Insertion (J4 @ t=24)")
     print("=" * 80)
-    initial_greedy, updated_greedy = simulate_greedy()
 
-    print_schedule(initial_greedy, "Initial Schedule (t=0) -- Greedy Hierarchical")
-    print_metrics(initial_greedy, jobs_t0, "Initial Greedy (t=0)")
-    print_schedule(updated_greedy,
-                   "Updated Schedule (t=24, J4 arrived) -- Greedy Hierarchical")
-    print_metrics(updated_greedy, jobs_t24, "Updated Greedy (t=24)")
+    exp1_t0, exp1_t24 = simulate_dynamic_arrival(all_jobs)
 
-    print(f"\n  -- Operations frozen at t=24 (Greedy) --")
-    frozen = [e for e in updated_greedy if e.fixed]
-    for e in frozen:
-        print(f"    J{e.job_id}-Op{e.op_idx + 1}  on {e.machine} "
-              f"({e.service_unit})  [{e.start_time:.1f} -> {e.end_time:.1f}]")
+    if exp1_t0 is None or exp1_t24 is None:
+        print("  [Gurobi not available -- MILP solver required]\n")
+        return
 
-    # ── MILP optimal ─────────────────────────────────────────────────────
-    initial_milp, updated_milp = simulate_milp()
+    print_schedule(exp1_t0, "Exp 1 — Initial Schedule (t=0)")
+    print_metrics(exp1_t0, jobs_t0, "Exp 1 Initial (t=0)")
+    print_schedule(exp1_t24, "Exp 1 — After Urgent J4 Insertion (t=24)")
+    print_metrics(exp1_t24, jobs_t24, "Exp 1 Updated (t=24)")
 
-    if initial_milp is not None and updated_milp is not None:
-        print("\n" + "=" * 80)
-        print("  METHOD 2: MILP Optimal (Gurobi)")
-        print("=" * 80)
-        print_schedule(initial_milp, "Initial Schedule (t=0) -- MILP Optimal")
-        print_metrics(initial_milp, jobs_t0, "Initial MILP (t=0)")
-        print_schedule(updated_milp,
-                       "Updated Schedule (t=24, J4 arrived) -- MILP Re-optimized")
-        print_metrics(updated_milp, jobs_t24, "Updated MILP (t=24)")
+    # ═════════════════════════════════════════════════════════════════════
+    # Experiment 2: Machine Disruption (continues from Exp 1 t=24 result)
+    # ═════════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 80)
+    print("  Experiment 2: Machine M1_U2 Disruption (t=60, proc.time x2)")
+    print("=" * 80)
 
-        print(f"\n  -- Operations frozen at t=24 (MILP) --")
-        frozen_milp = [e for e in updated_milp if e.fixed]
-        for e in frozen_milp:
-            print(f"    J{e.job_id}-Op{e.op_idx + 1}  on {e.machine} "
-                  f"({e.service_unit})  [{e.start_time:.1f} -> {e.end_time:.1f}]")
+    exp2_schedule = experiment2_machine_disruption(
+        all_jobs, exp1_t24,
+        disruption_time=60.0, disrupted_machine='M1_U2', factor=2.0)
 
-        # ── Comparison ──────────────────────────────────────────────────
-        m_greedy_init = compute_metrics(initial_greedy, jobs_t0)
-        m_greedy_upd  = compute_metrics(updated_greedy, jobs_t24)
-        m_milp_init   = compute_metrics(initial_milp, jobs_t0)
-        m_milp_upd    = compute_metrics(updated_milp, jobs_t24)
+    if exp2_schedule is None:
+        print("  [Experiment 2: MILP infeasible or Gurobi error]\n")
+        return
 
-        print(f"\n{'-' * 80}")
-        print(f"  Comparison: Greedy vs MILP")
-        print(f"{'-' * 80}")
-        hdr = (f"  {'Stage':<8s} {'Metric':<22s} "
-               f"{'Greedy':>10s}  {'MILP':>10s}  {'Gap':>10s}")
-        print(hdr)
-        print(f"  {'-' * len(hdr)}")
+    print_schedule(exp2_schedule, "Exp 2 — After M1_U2 Disruption (t=60)")
+    print_metrics(exp2_schedule, jobs_t24, "Exp 2 Disrupted (t=60)")
 
-        for label, gm, mm in [("t=0", m_greedy_init, m_milp_init),
-                              ("t=24", m_greedy_upd, m_milp_upd)]:
-            for mname, key in [("Total Penalty", "total_penalty"),
-                               ("Active Lead Time", "total_active_lead_time")]:
-                gv = gm[key]
-                mv = mm[key]
-                gap = gv - mv
-                print(f"  {label:<8s} {mname:<22s} "
-                      f"{gv:>10.1f}  {mv:>10.1f}  {gap:>+10.1f}")
+    # ═════════════════════════════════════════════════════════════════════
+    # 3-Panel Gantt Chart
+    # ═════════════════════════════════════════════════════════════════════
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 16))
 
-        # Per-job penalty breakdown
-        print(f"\n{'-' * 80}")
-        print(f"  Per-Job Penalty Breakdown (alpha*E + beta*T)")
-        print(f"{'-' * 80}")
-        jhdr = (f"  {'Job':>6s} {'dj':>6s} {'alpha':>5s} {'beta':>5s} "
-                f"{'Greedy Cj':>10s} {'MILP Cj':>10s} "
-                f"{'G-Pen':>10s} {'M-Pen':>10s} {'Delta':>10s}")
-        print(jhdr)
-        print(f"  {'-' * len(jhdr)}")
-        for jid in sorted(set(j.job_id for j in jobs_t24)):
-            job = next(j for j in jobs_t24 if j.job_id == jid)
-            gC = m_greedy_upd['completion'].get(jid, 0)
-            mC = m_milp_upd['completion'].get(jid, 0)
-            gE = max(0, job.due_date - gC)
-            gT = max(0, gC - job.due_date)
-            mE = max(0, job.due_date - mC)
-            mT = max(0, mC - job.due_date)
-            gPen = job.alpha * gE + job.beta * gT
-            mPen = job.alpha * mE + job.beta * mT
-            print(f"  {'J'+str(jid):>6s} {job.due_date:>6.0f} "
-                  f"{job.alpha:>5.0f} {job.beta:>5.0f} "
-                  f"{gC:>10.1f} {mC:>10.1f} "
-                  f"{gPen:>10.1f} {mPen:>10.1f} "
-                  f"{gPen - mPen:>+10.1f}")
+    x_max = max(
+        max(e.end_time for e in exp1_t0),
+        max(e.end_time for e in exp1_t24),
+        max(e.end_time for e in exp2_schedule),
+    ) * 1.08
 
-        # ── Validation ──────────────────────────────────────────────────
-        print(f"\n{'-' * 80}")
-        print(f"  Constraint Validation")
-        print(f"{'-' * 80}")
-        all_ok = True
-        for sched, lbl, jlist, ct in [
-            (initial_greedy, "Greedy-t0", jobs_t0, 0.0),
-            (updated_greedy, "Greedy-t24", jobs_t24, 24.0),
-            (initial_milp, "MILP-t0", jobs_t0, 0.0),
-            (updated_milp, "MILP-t24", jobs_t24, 24.0),
-        ]:
-            errs = validate_schedule(sched, jlist, ct, lbl)
-            if errs:
-                all_ok = False
-                for err in errs:
-                    print(f"  X {err}")
-            else:
-                print(f"  OK {lbl}: all constraints satisfied")
+    plot_gantt(exp1_t0, 'Exp 1 — Initial Schedule (t=0)', ax=ax1)
+    ax1.set_xlim(0, x_max)
 
-        # ── Gantt charts (2x2: Greedy vs MILP) ──────────────────────────
-        fig, axes = plt.subplots(2, 2, figsize=(18, 10))
+    plot_gantt(exp1_t24, 'Exp 1 — After Urgent J4 Insertion (t=24)',
+               current_time=24, ax=ax2)
+    ax2.set_xlim(0, x_max)
 
-        t0_max = max(max(e.end_time for e in initial_greedy),
-                     max(e.end_time for e in initial_milp)) * 1.08
-        t24_max = max(max(e.end_time for e in updated_greedy),
-                      max(e.end_time for e in updated_milp)) * 1.08
-        x_max = max(t0_max, t24_max)
+    plot_gantt(exp2_schedule,
+               'Exp 2 — After M1_U2 Disruption (t=60, proc.time x2)',
+               current_time=60, ax=ax3)
+    ax3.set_xlim(0, x_max)
 
-        plot_gantt(initial_greedy,
-                   'Greedy Hierarchical  --  Initial (t=0)', ax=axes[0, 0])
-        axes[0, 0].set_xlim(0, x_max)
-        plot_gantt(initial_milp, 'MILP Optimal  --  Initial (t=0)', ax=axes[0, 1])
-        axes[0, 1].set_xlim(0, x_max)
-
-        plot_gantt(updated_greedy,
-                   'Greedy Hierarchical  --  Updated (t=24)  (hatched = frozen)',
-                   current_time=24, ax=axes[1, 0])
-        axes[1, 0].set_xlim(0, x_max)
-        plot_gantt(updated_milp,
-                   'MILP Re-optimized  --  Updated (t=24)  (hatched = frozen)',
-                   current_time=24, ax=axes[1, 1])
-        axes[1, 1].set_xlim(0, x_max)
-
-        fig.tight_layout(pad=4.0)
-        plt.savefig('gantt_charts_hierarchical.png', dpi=150, bbox_inches='tight')
-        print(f"\n  Gantt charts saved to 'gantt_charts_hierarchical.png'")
-
-    else:
-        # No Gurobi — fallback to greedy only
-        print("\n  [Gurobi not available -- showing greedy results only]\n")
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10))
-        t0_max = max(e.end_time for e in initial_greedy) * 1.08
-        t24_max = max(e.end_time for e in updated_greedy) * 1.08
-        x_max = max(t0_max, t24_max)
-
-        plot_gantt(initial_greedy,
-                   'Initial Hierarchical Schedule  (t = 0)  --  J1, J2, J3',
-                   ax=ax1)
-        ax1.set_xlim(0, x_max)
-        plot_gantt(updated_greedy,
-                   'Updated Hierarchical Schedule  (t = 24, J4 arrives)  '
-                   '--  hatched = frozen',
-                   current_time=24,
-                   ax=ax2)
-        ax2.set_xlim(0, x_max)
-
-        fig.tight_layout(pad=3.0)
-        plt.savefig('gantt_charts_hierarchical.png', dpi=150, bbox_inches='tight')
-        print(f"\n  Gantt charts saved to 'gantt_charts_hierarchical.png'")
+    fig.suptitle('Hierarchical FJSP — Urgent Order (J4) & Machine Disruption (M1_U2)',
+                 fontsize=14, fontweight='bold', y=1.01)
+    fig.tight_layout(pad=3.0)
+    plt.savefig('gantt_charts_hierarchical.png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"\n  Gantt chart (3 panels) saved to 'gantt_charts_hierarchical.png'")
 
 
 if __name__ == '__main__':
