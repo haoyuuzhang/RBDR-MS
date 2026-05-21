@@ -42,7 +42,7 @@ def simulate_dynamic_arrival(
     return initial_schedule, updated_schedule
 
 
-def experiment2_machine_disruption(
+def simulate_machine_disruption(
     all_jobs: List[Job],
     previous_schedule: List[ScheduleEntry],
     disruption_time: float = 60.0,

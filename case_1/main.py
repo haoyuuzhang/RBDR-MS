@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from cases import build_jobs
-from simulation import simulate_dynamic_arrival, experiment2_machine_disruption
+from simulation import simulate_dynamic_arrival, simulate_machine_disruption
 from metrics import compute_metrics
 from plotting import plot_gantt
 
@@ -41,7 +41,7 @@ def main():
     # ═════════════════════════════════════════════════════════════════════
     print("Running Experiment 2: Machine Processing Time Disruption...")
     disruption_time = 56.0
-    exp2_schedule = experiment2_machine_disruption(
+    exp2_schedule = simulate_machine_disruption(
         all_jobs, exp1_t24,
         disruption_time=disruption_time, disrupted_machine='M1_U2', factor=2.0)
 
