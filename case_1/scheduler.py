@@ -2,7 +2,7 @@
 
 from typing import Dict, List, Optional, Tuple
 from models import Job, Operation, ScheduleEntry
-from config import TRANSPORT_TIME, BIG_M, machine_type_of
+from config import TRANSPORT_TIME, machine_type_of
 
 try:
     import gurobipy as _gp
@@ -81,6 +81,16 @@ def schedule_milp(
     env = _gp.Env(params={"OutputFlag": 0})
     model = _gp.Model("HierarchicalFJSP", env=env)
     model.Params.TimeLimit = time_limit
+    model.Params.MIPGap = 0.0
+    model.Params.MIPFocus = 2
+
+    # Tight M: sum of max processing times + transport + disruption slack
+    big_m = 0.0
+    for job in jobs:
+        for op in job.operations:
+            big_m += max(op.unit_times.values()) if op.unit_times else 0
+    big_m += TRANSPORT_TIME * sum(len(job.operations) for job in jobs)
+    big_m = max(big_m * (max(time_factors.values()) if time_factors else 1.0), 500.0)
 
     # ── Variables ──────────────────────────────────────────────────────
     u: Dict[Tuple[int, int, str], _gp.Var] = {}   # unit assignment
@@ -264,11 +274,11 @@ def schedule_milp(
 
                 model.addConstr(
                     s[a_key] + a_dur_expr <= s[b_key]
-                    + BIG_M * (3 - u_a - u_b - y_var),
+                    + big_m * (3 - u_a - u_b - y_var),
                     name=f"disj1_{a_key}_{b_key}_{unit_name}")
                 model.addConstr(
                     s[b_key] + b_dur_expr <= s[a_key]
-                    + BIG_M * (2 - u_a - u_b + y_var),
+                    + big_m * (2 - u_a - u_b + y_var),
                     name=f"disj2_{a_key}_{b_key}_{unit_name}")
 
     # (7) Fixed entries block their machines
@@ -281,7 +291,7 @@ def schedule_milp(
                 if op.machine_type == mtype and unit_name in op.unit_times:
                     model.addConstr(
                         s[key] >= e.end_time
-                        - BIG_M * (1 - u[(key[0], key[1], unit_name)]),
+                        - big_m * (1 - u[(key[0], key[1], unit_name)]),
                         name=f"block_{e.job_id}_{e.op_idx}_{key}")
 
     # ── Objective ──────────────────────────────────────────────────────

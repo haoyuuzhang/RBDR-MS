@@ -58,7 +58,8 @@ def plot_gantt(schedule: List[ScheduleEntry],
     u1_mid = (0 + len(SERVICE_UNITS['U1']) - 1) / 2
     u2_mid = len(SERVICE_UNITS['U1']) + (0 + len(SERVICE_UNITS['U2']) - 1) / 2
     for unit, mid_y in [('U1', u1_mid), ('U2', u2_mid)]:
-        ax.text(1.01, mid_y / len(y_positions), f'Service\nUnit {unit}',
+        ax.text(1.01, (len(y_positions) - 0.5 - mid_y) / len(y_positions),
+                f'Service\nUnit {unit}',
                 transform=ax.transAxes, ha='left', va='center',
                 fontsize=9, fontweight='bold', color='#555555')
 

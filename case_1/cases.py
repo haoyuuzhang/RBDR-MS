@@ -24,16 +24,16 @@ def build_jobs() -> List[Job]:
                 Operation(2, 1, 'M2', {'U1': 30, 'U2': 22}),
                 Operation(2, 2, 'M1', {'U1': 15, 'U2': 20}),
             ]),
-        Job(job_id=3, release_date=0, due_date=80, alpha=1, beta=2,
+        Job(job_id=3, release_date=0, due_date=72, alpha=1, beta=3,
             arrival_time=0, operations=[
                 Operation(3, 0, 'M1', {'U1': 24, 'U2': 18}),
                 Operation(3, 1, 'M2', {'U1': 24, 'U2': 28}),
-                Operation(3, 2, 'M1', {'U1': 16, 'U2': 12}),
+                Operation(3, 2, 'M1', {'U1': 12, 'U2': 16}),
             ]),
-        Job(job_id=4, release_date=48, due_date=96, alpha=1, beta=6,
+        Job(job_id=4, release_date=48, due_date=96, alpha=1, beta=12,
             arrival_time=24, operations=[
                 Operation(4, 0, 'M3', {'U1': 12}),
                 Operation(4, 1, 'M1', {'U1': 20, 'U2': 12}),
-                Operation(4, 2, 'M2', {'U1': 16, 'U2': 18}),
+                Operation(4, 2, 'M2', {'U1': 16, 'U2': 16}),
             ]),
     ]
