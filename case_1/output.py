@@ -3,8 +3,8 @@
 import csv
 import os
 from typing import List
-from models import Job, ScheduleEntry
-from metrics import compute_metrics
+from .models import Job, ScheduleEntry
+from .metrics import compute_metrics
 
 
 def save_results_csv(schedule: List[ScheduleEntry], jobs: List[Job],

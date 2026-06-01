@@ -6,8 +6,8 @@ Experiments:
 """
 
 from typing import List, Optional, Tuple
-from models import Job, ScheduleEntry
-from scheduler import schedule_milp
+from .models import Job, ScheduleEntry
+from .scheduler import schedule_milp
 
 
 def simulate_dynamic_arrival(

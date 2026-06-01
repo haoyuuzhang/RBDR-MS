@@ -6,7 +6,7 @@ Machine sequences:
 """
 
 from typing import List
-from models import Job, Operation
+from .models import Job, Operation
 
 
 def build_jobs() -> List[Job]:

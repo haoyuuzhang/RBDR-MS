@@ -3,8 +3,8 @@
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from typing import List, Optional
-from models import ScheduleEntry
-from config import SERVICE_UNITS
+from .models import ScheduleEntry
+from .config import SERVICE_UNITS
 
 JOB_COLORS = {
     1: '#4C72B0',

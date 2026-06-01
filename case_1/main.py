@@ -2,17 +2,31 @@
 
 Runs Experiment 1 (urgent order insertion) and Experiment 2 (machine disruption),
 saves results to CSV/JSON files, and displays Gantt charts interactively.
+
+Usage::
+
+    python  case_1/main.py          # run as script
+    python -m case_1.main           # run as module
 """
 
+import sys
 import os
+
+# Support both ``python case_1/main.py`` and ``python -m case_1.main``
+if __package__ is None:
+    _PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _PROJ not in sys.path:
+        sys.path.insert(0, _PROJ)
+    __package__ = 'case_1'
+
 import csv
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from cases import build_jobs
-from simulation import simulate_dynamic_arrival, simulate_machine_disruption
-from metrics import compute_metrics
-from plotting import plot_gantt
+from .cases import build_jobs
+from .simulation import simulate_dynamic_arrival, simulate_machine_disruption
+from .metrics import compute_metrics
+from .plotting import plot_gantt
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 
