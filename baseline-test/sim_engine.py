@@ -68,7 +68,7 @@ class SimulationEngine:
         self.visible_jobs: List[Job] = []
         self.machine_factors: Dict[str, float] = {m: 1.0 for m in machines}
         self._idle_rounds = 0
-        self._max_idle_rounds = 200  # safety: prevent infinite idle loops
+        self._max_idle_rounds = 20000  # safety: prevent infinite idle loops (covers ~10000 time units / 0.5s polling)
         self._job_last_unit: Dict[int, str] = {}  # job_id -> unit of last completed op
 
         # For tracking in-progress ops (used by disruption handler)
@@ -77,6 +77,20 @@ class SimulationEngine:
 
         # For handling release_date delays
         self._release_events_scheduled: set = set()
+
+        # Pre-computed factor-change events for _adjusted_duration
+        # machine_id -> [(time, new_factor), ...] sorted by time
+        self._factor_events: Dict[str, List[Tuple[float, float]]] = {}
+        for mid in machines:
+            self._factor_events[mid] = [(0.0, 1.0)]
+        for d in self.disruptions:
+            events = self._factor_events.setdefault(d.machine_id, [(0.0, 1.0)])
+            events.append((d.time, d.factor))
+            if d.duration > 0:
+                recovery_time = d.time + d.duration
+                events.append((recovery_time, 1.0))
+        for mid in self._factor_events:
+            self._factor_events[mid].sort(key=lambda x: x[0])
 
         # --- initialization ---
         for job in self.jobs:
@@ -95,7 +109,18 @@ class SimulationEngine:
     # ── public API ───────────────────────────────────────────────────────
 
     def run(self, until: Optional[float] = None) -> List[ScheduleEntry]:
-        """Run the simulation and return the completed schedule."""
+        """Run the simulation and return the completed schedule.
+
+        If *until* is None, defaults to ``time_horizon * 2`` as a hard safety cap
+        (jobs and disruptions all occur within the horizon, so 2× is generous).
+        """
+        if until is None:
+            # Derive a hard time cap from the latest disruption/job arrival
+            max_arrival = max((j.arrival_time for j in self.jobs), default=0)
+            max_release = max((j.release_date for j in self.jobs), default=0)
+            max_disruption = max((d.time for d in self.disruptions), default=0)
+            horizon = max(max_arrival, max_release, max_disruption, 200.0)
+            until = horizon * 2.0
         # Start machine loops
         for mid in self.machines:
             self.env.process(self._machine_loop(mid))
@@ -166,8 +191,7 @@ class SimulationEngine:
                     if self.op_status.get((job_id, op_idx)) != 'ready':
                         continue
 
-            # Apply machine time-factor (for post-disruption ops)
-            factor = self.machine_factors.get(machine_id, 1.0)
+            # Compute actual duration accounting for time-varying machine factors
             duration = self._adjusted_duration(machine_id, base_duration,
                                                self.env.now)
 
@@ -204,12 +228,27 @@ class SimulationEngine:
     # ── disruption ───────────────────────────────────────────────────────
 
     def _disruption_process(self, disruption: Disruption):
+        """Apply disruption at its onset time; schedule recovery if duration > 0."""
         delay = disruption.time - self.env.now
         if delay > 0:
             yield self.env.timeout(delay)
 
         self.machine_factors[disruption.machine_id] = disruption.factor
         self.strategy.on_disruption(disruption)
+
+        # Schedule automatic recovery
+        if disruption.duration > 0:
+            yield self.env.timeout(disruption.duration)
+            self.machine_factors[disruption.machine_id] = 1.0
+            # Notify strategy of recovery as a "reverse disruption" (factor=1.0)
+            recovery = Disruption(
+                time=self.env.now,
+                machine_id=disruption.machine_id,
+                factor=1.0,
+                duration=0.0,
+                description=f"{disruption.machine_id} recovered",
+            )
+            self.strategy.on_disruption(recovery)
 
     # ── operation lifecycle ──────────────────────────────────────────────
 
@@ -262,21 +301,43 @@ class SimulationEngine:
 
     def _adjusted_duration(self, machine_id: str, base_duration: float,
                            start_time: float) -> float:
-        """Scale duration for disruptions that occur mid-processing or after."""
-        factor = self.machine_factors.get(machine_id, 1.0)
-        end_time = start_time + base_duration * factor
+        """Compute actual wall-clock duration accounting for time-varying factors.
 
-        # Handle mid-processing disruption (operation spanned the factor change)
-        for d in self.disruptions:
-            if d.machine_id != machine_id:
-                continue
-            if start_time < d.time < end_time:
-                # Recompute: work done at old rate + remaining at new rate
-                before = d.time - start_time
-                remaining = base_duration - before / factor
-                if remaining > 0:
-                    end_time = d.time + remaining * d.factor
-        return end_time - start_time
+        Walks through the pre-computed factor-change events for *machine_id*,
+        accumulating ``base_duration`` units of "effective work" segment by
+        segment.  Handles disruption onset AND recovery mid-operation.
+        """
+        events = self._factor_events.get(machine_id, [(0.0, 1.0)])
+
+        remaining = base_duration  # effective work still needed
+        seg_start = start_time
+
+        # Find current segment index (the one containing start_time)
+        seg_idx = 0
+        for i, (t, _) in enumerate(events):
+            if t <= start_time:
+                seg_idx = i
+            else:
+                break
+
+        while remaining > 1e-9 and seg_idx < len(events):
+            _, seg_factor = events[seg_idx]
+            seg_end = events[seg_idx + 1][0] if seg_idx + 1 < len(events) else float('inf')
+
+            seg_available = seg_end - seg_start
+            work_in_segment = seg_available / seg_factor  # base units completed
+
+            if work_in_segment >= remaining:
+                # Operation finishes within this segment
+                return (seg_start + remaining * seg_factor) - start_time
+
+            remaining -= work_in_segment
+            seg_start = seg_end
+            seg_idx += 1
+
+        # Fell through all events — finish with current (last) factor
+        current_factor = self.machine_factors.get(machine_id, 1.0)
+        return (seg_start + remaining * current_factor) - start_time
 
     def _find_job(self, job_id: int) -> Optional[Job]:
         for j in self.visible_jobs:
@@ -308,6 +369,10 @@ class SimulationEngine:
             return False
         if self._get_ready_ops():
             return False
+        # Future jobs will arrive — keep waiting (prevents premature termination)
+        for job in self.jobs:
+            if job.arrival_time > self.env.now:
+                return False
         # No progress possible — mark remaining ops as skipped
         for job in self.jobs:
             for op in job.operations:

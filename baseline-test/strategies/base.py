@@ -90,6 +90,30 @@ class BaseStrategy(ABC):
             return (jid, oidx, entry.service_unit, duration)
         return None
 
+    # ── greedy fallback ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _greedy_ect(
+        machine_id: str, unit: str,
+        ready_ops: List[Tuple[Job, Operation]],
+    ) -> Optional[Tuple[int, int, str, float]]:
+        """Greedy Earliest-Completion-Time dispatching — fallback when MILP fails.
+
+        Returns ``(job_id, op_idx, unit_name, duration)`` or *None*.
+        """
+        if not ready_ops:
+            return None
+        best: Optional[Tuple[int, int, str, float]] = None
+        best_completion = float('inf')
+        for job, op in ready_ops:
+            p = op.unit_times.get(unit)
+            if p is None:
+                continue
+            if p < best_completion:
+                best_completion = p
+                best = (job.job_id, op.op_idx, unit, p)
+        return best
+
     # ── abstract interface ────────────────────────────────────────────────
 
     @abstractmethod

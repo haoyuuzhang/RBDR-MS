@@ -25,7 +25,7 @@ from models import Job, Operation, ScheduleEntry, Disruption
 
 
 # Shop-level dispatching rules
-_SHOP_RULES = ['ECT', 'EST', 'SPT', 'LBU']
+_SHOP_RULES = ['ECT', 'EST', 'SPT', 'LBU', 'PA']
 
 
 class HierarchicalStrategy(BaseStrategy):
@@ -38,19 +38,29 @@ class HierarchicalStrategy(BaseStrategy):
                      'EST' - Earliest Start Time
                      'SPT' - Shortest Processing Time
                      'LBU' - Least Busy Unit (earliest machine free time)
+                     'PA'  - Penalty-Aware: for the last op of each job,
+                             estimates α·E + β·T + λ·(machine_ready − now)
+                             and picks the unit with the lowest score;
+                             non-last ops fall back to ECT.  Jobs with
+                             higher max(α, β) are assigned first.
     unit_time_limit: Gurobi time limit for the unit-level scheduling MILP.
     init_time_limit: Gurobi time limit for the initial t=0 MILP plan.
+    penalty_lambda:  Weight for the machine-load-balance term in the PA
+                     shop rule (default 0.5).  Higher values spread work
+                     more evenly across units.
     """
 
     def __init__(self, shop_rule: str = 'ECT',
                  unit_time_limit: float = 30.0,
-                 init_time_limit: float = 60.0):
+                 init_time_limit: float = 60.0,
+                 penalty_lambda: float = 2.0):
         super().__init__()
         if shop_rule not in _SHOP_RULES:
             raise ValueError(f"shop_rule must be one of {_SHOP_RULES}, got {shop_rule!r}")
         self.shop_rule = shop_rule
         self.unit_time_limit = unit_time_limit
         self.init_time_limit = init_time_limit
+        self.penalty_lambda = penalty_lambda
         self._plan: Dict[Tuple[int, int, str], ScheduleEntry] = {}
         self._time_factors: Dict[str, float] = {}
         self._plan_valid = False
@@ -67,7 +77,12 @@ class HierarchicalStrategy(BaseStrategy):
         self, machine_id: str, machine_type: str, unit: str,
         current_time: float, ready_ops: List[Tuple[Job, Operation]],
     ) -> Optional[Tuple[int, int, str, float]]:
-        return self._lookup_plan(machine_id, self._plan) if self._plan_valid else None
+        if self._plan_valid:
+            result = self._lookup_plan(machine_id, self._plan)
+            if result is not None:
+                return result
+        # Fallback when MILP plan is missing / invalid: greedy ECT
+        return self._greedy_ect(machine_id, unit, ready_ops)
 
     def on_job_arrival(self, job: Job):
         self._run_hierarchical(self.engine.env.now)
@@ -137,7 +152,14 @@ class HierarchicalStrategy(BaseStrategy):
 
         assignments: Dict[Tuple[int, int], str] = {}
 
-        for job in sorted(visible, key=lambda j: (j.release_date, j.job_id)):
+        if self.shop_rule == 'PA':
+            job_order = sorted(visible,
+                key=lambda j: (-max(j.alpha, j.beta), j.release_date, j.job_id))
+        else:
+            job_order = sorted(visible,
+                key=lambda j: (j.release_date, j.job_id))
+
+        for job in job_order:
             prev_completion = max(current_time, job.release_date)
             prev_unit: Optional[str] = None
 
@@ -176,6 +198,17 @@ class HierarchicalStrategy(BaseStrategy):
                         score = proc_time
                     elif self.shop_rule == 'LBU':
                         score = machine_ready
+                    elif self.shop_rule == 'PA':
+                        is_last_op = (op.op_idx == len(job.operations) - 1)
+                        if is_last_op:
+                            Cj_est = completion
+                            E_est = max(0.0, job.due_date - Cj_est)
+                            T_est = max(0.0, Cj_est - job.due_date)
+                            penalty_est = job.alpha * E_est + job.beta * T_est
+                            load_penalty = machine_ready - current_time
+                            score = penalty_est + self.penalty_lambda * load_penalty
+                        else:
+                            score = completion  # non-last op: fall back to ECT
 
                     if (score < best_score
                             or (score == best_score and completion < best_completion)):

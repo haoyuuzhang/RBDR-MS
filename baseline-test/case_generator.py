@@ -172,29 +172,45 @@ def _make_job(
         operations.append(Operation(jid, idx, mtype, unit_times))
         total_min_time += min(unit_times.values())
 
-    # Due-date: random tightness
-    tightness = rng.choice(['tight', 'medium', 'loose'])
+    # Due-date: random tightness (biased toward loose to create earliness-penalty jobs)
+    tightness = rng.choices(
+        ['tight', 'medium', 'loose', 'very_loose'],
+        weights=[0.15, 0.25, 0.40, 0.20],
+        k=1,
+    )[0]
     if tightness == 'tight':
         dd_factor = rng.uniform(0.9, 1.3)
     elif tightness == 'medium':
         dd_factor = rng.uniform(1.3, 1.8)
-    else:
-        dd_factor = rng.uniform(1.8, 2.5)
+    elif tightness == 'loose':
+        dd_factor = rng.uniform(1.8, 3.0)
+    else:  # very_loose
+        dd_factor = rng.uniform(3.0, 4.5)
 
     due_date = round(max(release, arrival) + total_min_time * dd_factor, 1)
 
     # Penalty weights
     # alpha (earliness) — higher for jobs with wide due-date windows:
-    #   finishing way early when you had plenty of time wastes resources
+    #   finishing way early when you had plenty of time wastes resources.
+    #   Designed so that PA shop rule can exploit the V-shaped penalty curve.
     slack_ratio = (due_date - max(release, arrival)) / max(total_min_time, 0.1)
-    if slack_ratio > 1.8:          # loose due-date → high earliness penalty
-        alpha = rng.choice([2, 3, 4])
-    elif slack_ratio > 1.3:        # medium window
-        alpha = rng.choice([1, 2, 3])
+    if slack_ratio > 3.0:          # very loose due-date → dominant earliness penalty
+        alpha = rng.choice([4, 5, 6, 7, 8])
+    elif slack_ratio > 2.2:        # loose due-date → high earliness penalty
+        alpha = rng.choice([2, 3, 4, 5])
+    elif slack_ratio > 1.5:        # moderately loose
+        alpha = rng.choice([1, 2, 3, 4])
+    elif slack_ratio > 1.1:        # medium window
+        alpha = rng.choice([0, 1, 2, 3])
     else:                           # tight window
         alpha = rng.choice([0, 1, 2])
 
-    beta = rng.choice([1, 2, 3, 4, 5])     # tardiness always penalised
+    # beta (tardiness) — range narrowed relative to alpha so that earliness
+    # can dominate for loose jobs (α ≫ β creates the V-shape that PA exploits)
+    if slack_ratio > 2.2:
+        beta = rng.choice([1, 2, 3])
+    else:
+        beta = rng.choice([1, 2, 3, 4, 5])
 
     return Job(
         job_id=jid,
@@ -213,7 +229,7 @@ def _make_disruptions(
     time_horizon: float,
     rng: random.Random,
 ) -> List[Disruption]:
-    """Generate 1-2 random machine disruptions."""
+    """Generate 1-2 random machine disruptions with finite duration."""
     disruptions: List[Disruption] = []
     n_disruptions = rng.choice([1, 2])
 
@@ -229,11 +245,17 @@ def _make_disruptions(
             d_time = round(time_horizon * 0.25 + rng.random() * time_horizon * 0.4, 1)
         used_times.append(d_time)
         factor = rng.choice([1.5, 2.0, 2.5])
+        # Duration: 20–60 time units, must not extend past the horizon
+        max_dur = time_horizon - d_time
+        dur = round(rng.uniform(20, min(60, max_dur)), 1)
+        description = (f"{mid} factor=×{factor} for {dur}tu"
+                       if dur > 0 else f"{mid} factor=×{factor} (permanent)")
         disruptions.append(Disruption(
             time=d_time,
             machine_id=mid,
             factor=factor,
-            description=f"{mid} processing time x{factor}",
+            duration=dur,
+            description=description,
         ))
 
     return sorted(disruptions, key=lambda d: d.time)
@@ -277,6 +299,7 @@ def case_to_dict(jobs: List[Job],
                 'time': d.time,
                 'machine_id': d.machine_id,
                 'factor': d.factor,
+                'duration': d.duration,
                 'description': d.description,
             }
             for d in disruptions

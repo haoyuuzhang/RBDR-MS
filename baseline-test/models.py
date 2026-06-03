@@ -47,7 +47,8 @@ class MachineConfig:
 
 @dataclass
 class Disruption:
-    time: float
-    machine_id: str
-    factor: float = 2.0
+    time: float              # when the disruption starts
+    machine_id: str          # which machine is affected
+    factor: float = 2.0      # processing-time multiplier during the disruption
+    duration: float = 0.0    # how long it lasts (0 = permanent, i.e. no recovery)
     description: str = ""
