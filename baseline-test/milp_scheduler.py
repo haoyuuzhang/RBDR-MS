@@ -378,7 +378,7 @@ def schedule_milp_clairvoyant(
     )
     horizon = max_release + total_work / max(machine_count, 1)
     horizon = max(horizon, 200.0) * 1.5  # generous buffer
-    n_samples = 50  # PWL sample points
+    n_samples = 200  # PWL sample points (fine-grained for disruption boundaries)
 
     # ── Pre-compute PWL breakpoints for disrupted machines ─────────────
     # pwl_data[(jid, oidx, unit)] = (xs, ys)  or  None for non-disrupted
@@ -398,8 +398,8 @@ def schedule_milp_clairvoyant(
     env = _gp.Env(params={"OutputFlag": 0})
     model = _gp.Model("FJSP_Clairvoyant", env=env)
     model.Params.TimeLimit = time_limit
-    model.Params.MIPGap = 0.01
-    model.Params.MIPFocus = 1
+    model.Params.MIPGap = 0.001        # tight gap — clairvoyant must be near-optimal
+    model.Params.MIPFocus = 0          # balanced: don't sacrifice optimality for speed
     model.Params.Seed = 0
     model.Params.NodefileStart = 0.5
 
@@ -731,14 +731,33 @@ def _make_pwl_breakpoints(
     disruptions: List[Disruption],
     horizon: float, n_samples: int,
 ) -> Tuple[List[float], List[float]]:
-    """Sample the effective-duration function to create PWL breakpoints."""
-    xs: List[float] = []
-    ys: List[float] = []
+    """Build PWL breakpoints that exactly capture the effective-duration function.
+
+    The function is piecewise-linear with slope changes ONLY at disruption
+    onset/recovery times.  By including every disruption boundary as a
+    breakpoint, the PWL model becomes *exact* — not an approximation.
+    Evenly-spaced samples fill the gaps for smooth coverage.
+    """
+    # Collect every event time where the factor changes for this machine
+    event_times: set[float] = {0.0}
+    for d in disruptions:
+        if d.machine_id == machine_id:
+            event_times.add(d.time)
+            if d.duration > 0:
+                event_times.add(d.time + d.duration)
+    sorted_events = sorted(event_times)
+
+    # Merge: event boundaries + evenly-spaced samples → deduplicated, sorted
+    merged: set[float] = set()
+    for t in sorted_events:
+        merged.add(t)
     for k in range(n_samples + 1):
-        t = horizon * k / n_samples
-        dur = _effective_dur_at(t, base_dur, machine_id, disruptions)
-        xs.append(t)
-        ys.append(dur)
+        merged.add(horizon * k / n_samples)
+
+    xs: List[float] = sorted(merged)
+    ys: List[float] = [
+        _effective_dur_at(t, base_dur, machine_id, disruptions) for t in xs
+    ]
     return xs, ys
 
 

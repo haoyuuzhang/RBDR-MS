@@ -15,31 +15,23 @@ if _PROJ not in sys.path:
     sys.path.insert(0, _PROJ)
 
 from case_generator import generate_case
-from metrics import compute_metrics
+from metrics import compute_metrics, compute_resilience
 from sim_engine import SimulationEngine
-from strategies import (HierarchicalStrategy, PureRuleStrategy,
-                         ClairvoyantMILPStrategy)
+from strategies import PureRuleStrategy, ClairvoyantMILPStrategy
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # sweep configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
-N_SEEDS = 5
-START_SEED = 41
+N_SEEDS = 1
+START_SEED = 45
 
-# (label, shop_rule, penalty_lambda) — PA with λ=0.1 and LBU-approximation with λ=10.0
-HIER_CONFIGS = [
-    ('PA',  'PA', 0.1),   # penalty-aware, light load tiebreaker
-    ('LBU', 'PA', 10.0),  # load-dominated → essentially Least Busy Unit
-]
-HIER_RULES = [c[0] for c in HIER_CONFIGS]
-PURE_RULES = ['FIFO', 'EDD', 'ATC']
+PURE_RULES = ['FIFO', 'EDD', 'SPT', 'WINQ', 'PA']
 CLAIRVOYANT_BASELINE = ['Clairvoyant']
-ALL_RULES = HIER_RULES + PURE_RULES
 
-COLORS = {'PA': '#27AE60', 'LBU': '#8E44AD',
-          'FIFO': '#95A5A6', 'EDD': '#F39C12', 'ATC': '#1ABC9C',
-          'Clairvoyant': "#2357C7"}
+COLORS = {'FIFO': '#95A5A6', 'EDD': '#F39C12', 'SPT': '#1ABC9C',
+          'WINQ': '#E67E22', 'PA': '#27AE60',
+          'Clairvoyant': '#2357C7'}
 
 # ── Shared machine layout (fixed across all scales) ──
 # 5 service units, 18 machines, 4 machine types (M1–M4)
@@ -60,66 +52,83 @@ SCALES: list[tuple[str, int, int]] = [
     ('Large',  16, 10),    #  26 jobs, ratio 1.44
 ]
 
-HIER_UNIT_LIMIT = 15   # per-unit limit for hierarchical
-HIER_INIT_LIMIT = 30   # initial-plan limit for hierarchical
-CLAIRVOYANT_TIME_LIMIT = 120  # one-shot offline-optimal baseline
+CLAIRVOYANT_TIME_LIMIT = 30  # one-shot offline-optimal baseline
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_METRICS_KEYS = ['makespan', 'penalty', 'lead_time', 'time']
+_METRICS_KEYS = [
+    # Time-based
+    'makespan', 'total_flow_time', 'total_waiting_time', 'avg_flow_time',
+    'machine_utilization',
+    # Quality-based
+    'total_penalty', 'max_tardiness', 'avg_tardiness', 'max_earliness',
+    'avg_earliness',
+    # Resilience-based
+    'schedule_deviation', 'sequence_deviation',
+    # Computation
+    'time',
+]
 
 def _run_one_seed(jobs, machines, disruptions):
-    """Run one seed across all strategies, return per-strategy metrics."""
+    """Run one seed across all strategies, return per-strategy metrics.
+
+    Clairvoyant runs first and serves as the reference schedule for
+    resilience metrics of the pure dispatching rules.
+    """
     results: dict[str, dict] = {}
 
-    n_jobs = len(jobs)
+    # ── Clairvoyant (reference for resilience) ───────────────────────
+    t0 = perf_counter()
+    engine = SimulationEngine(jobs, machines,
+                              ClairvoyantMILPStrategy(time_limit=CLAIRVOYANT_TIME_LIMIT),
+                              disruptions, idle_timeout=0.01)
+    ref_schedule = engine.run()
+    ref_m = compute_metrics(ref_schedule, jobs)
+    results['Clairvoyant'] = _pack_result(ref_m, schedule_deviation=0.0,
+                                          sequence_deviation=0.0,
+                                          elapsed=perf_counter() - t0)
 
-    for label, shop_rule, lam in HIER_CONFIGS:
-        t0 = perf_counter()
-        engine = SimulationEngine(jobs, machines,
-                                  HierarchicalStrategy(
-                                      shop_rule=shop_rule,
-                                      unit_time_limit=HIER_UNIT_LIMIT,
-                                      init_time_limit=HIER_INIT_LIMIT,
-                                      penalty_lambda=lam),
-                                  disruptions)
-        m = compute_metrics(engine.run(), jobs)
-        results[label] = {
-            'makespan': m['makespan'],
-            'penalty': m['total_penalty'],
-            'lead_time': m['total_active_lead_time'] / n_jobs if n_jobs else 0,
-            'time': perf_counter() - t0,
-        }
-
+    # ── Pure dispatching rules ───────────────────────────────────────
     for rule in PURE_RULES:
         t0 = perf_counter()
         engine = SimulationEngine(jobs, machines,
                                   PureRuleStrategy(rule=rule),
                                   disruptions)
-        m = compute_metrics(engine.run(), jobs)
-        results[rule] = {
-            'makespan': m['makespan'],
-            'penalty': m['total_penalty'],
-            'lead_time': m['total_active_lead_time'] / n_jobs if n_jobs else 0,
-            'time': perf_counter() - t0,
-        }
-
-    # Clairvoyant (offline-optimal baseline: knows all jobs & disruptions at t=0)
-    t0 = perf_counter()
-    engine = SimulationEngine(jobs, machines,
-                              ClairvoyantMILPStrategy(time_limit=CLAIRVOYANT_TIME_LIMIT),
-                              disruptions)
-    m = compute_metrics(engine.run(), jobs)
-    results['Clairvoyant'] = {
-        'makespan': m['makespan'],
-        'penalty': m['total_penalty'],
-        'lead_time': m['total_active_lead_time'] / n_jobs if n_jobs else 0,
-        'time': perf_counter() - t0,
-    }
+        schedule = engine.run()
+        m = compute_metrics(schedule, jobs)
+        r = compute_resilience(schedule, ref_schedule)
+        results[rule] = _pack_result(m,
+                                     schedule_deviation=r['schedule_deviation'],
+                                     sequence_deviation=r['sequence_deviation'],
+                                     elapsed=perf_counter() - t0)
 
     return results
+
+
+def _pack_result(m: dict, schedule_deviation: float,
+                 sequence_deviation: float, elapsed: float) -> dict:
+    """Unpack compute_metrics output into a flat dict for CSV / averages."""
+    return {
+        # Time-based
+        'makespan':            m['makespan'],
+        'total_flow_time':     m['total_flow_time'],
+        'total_waiting_time':  m['total_waiting_time'],
+        'avg_flow_time':       m['avg_flow_time'],
+        'machine_utilization': m['machine_utilization'],
+        # Quality-based
+        'total_penalty': m['total_penalty'],
+        'max_tardiness': m['max_tardiness'],
+        'avg_tardiness': m['avg_tardiness'],
+        'max_earliness': m['max_earliness'],
+        'avg_earliness': m['avg_earliness'],
+        # Resilience
+        'schedule_deviation': schedule_deviation,
+        'sequence_deviation': sequence_deviation,
+        # Computation
+        'time': elapsed,
+    }
 
 
 def _run_scale_experiment(label, n_init, n_dyn):
@@ -148,11 +157,15 @@ def _run_scale_experiment(label, n_init, n_dyn):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 CSV_COLUMNS = ['scale', 'n_jobs', 'seed', 'strategy',
-               'makespan', 'penalty', 'lead_time', 'time']
+               'makespan', 'total_flow_time', 'total_waiting_time',
+               'avg_flow_time', 'machine_utilization',
+               'total_penalty', 'max_tardiness', 'avg_tardiness',
+               'max_earliness', 'avg_earliness',
+               'schedule_deviation', 'sequence_deviation', 'time']
 
 
 def main():
-    strategies = ALL_RULES + CLAIRVOYANT_BASELINE
+    strategies = PURE_RULES + CLAIRVOYANT_BASELINE
     job_counts = [n_init + n_dyn for _, n_init, n_dyn in SCALES]
 
     out_dir = os.path.join(os.path.dirname(__file__), 'output')
@@ -187,8 +200,17 @@ def main():
                         'seed': seed,
                         'strategy': s,
                         'makespan': f"{r['makespan']:.2f}",
-                        'penalty': f"{r['penalty']:.2f}",
-                        'lead_time': f"{r['lead_time']:.2f}",
+                        'total_flow_time': f"{r['total_flow_time']:.2f}",
+                        'total_waiting_time': f"{r['total_waiting_time']:.2f}",
+                        'avg_flow_time': f"{r['avg_flow_time']:.2f}",
+                        'machine_utilization': f"{r['machine_utilization']:.4f}",
+                        'total_penalty': f"{r['total_penalty']:.2f}",
+                        'max_tardiness': f"{r['max_tardiness']:.2f}",
+                        'avg_tardiness': f"{r['avg_tardiness']:.2f}",
+                        'max_earliness': f"{r['max_earliness']:.2f}",
+                        'avg_earliness': f"{r['avg_earliness']:.2f}",
+                        'schedule_deviation': f"{r['schedule_deviation']:.4f}",
+                        'sequence_deviation': f"{r['sequence_deviation']:.4f}",
                         'time': f"{r['time']:.4f}",
                     })
 
@@ -230,75 +252,125 @@ def main():
     import matplotlib.pyplot as plt
     import numpy as np
 
-    DISPLAY_NAMES = {'PA': 'Hierarchical-PA', 'LBU': 'Hierarchical-LBU',
-                     'FIFO': 'FIFO', 'EDD': 'EDD', 'ATC': 'ATC',
+    DISPLAY_NAMES = {'FIFO': 'FIFO', 'EDD': 'EDD', 'SPT': 'SPT',
+                     'WINQ': 'WINQ', 'PA': 'PA',
                      'Clairvoyant': 'Clairvoyant'}
 
     n_scales = len(SCALES)
     x_pos = np.arange(n_scales)
     x_labels = [str(jc) for jc in job_counts]
 
-    # ── line chart: 2×2 grid ──
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-    axes_flat = axes.flatten()
+    # ── helper: one subplot per metric ──────────────────────────────────
+    def _draw_grid(axes_flat, metric_list, strategies, averages,
+                   n_scales, x_pos, x_labels):
+        """Fill a grid of axes with line plots, one metric per cell."""
+        for col, (metric, metric_title) in enumerate(metric_list):
+            if col >= len(axes_flat):
+                break
+            ax = axes_flat[col]
+            for s in strategies:
+                vals = [averages[i][s][metric] for i in range(n_scales)]
+                ax.plot(x_pos, vals, marker='o', markersize=7,
+                        color=COLORS[s], linewidth=2.2, alpha=0.9,
+                        label=DISPLAY_NAMES[s])
+            ax.set_title(metric_title, fontsize=12, fontweight='bold')
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(x_labels, fontsize=9)
+            ax.set_xlabel('Number of Jobs', fontsize=9)
+            ax.grid(alpha=0.3)
+        # Hide unused cells
+        for extra in range(len(metric_list), len(axes_flat)):
+            axes_flat[extra].set_visible(False)
 
-    metrics_display = [
-        ('makespan',  'Makespan'),
-        ('penalty',   'Total Penalty'),
-        ('lead_time', 'Avg Active Lead Time'),
-        ('time',      'Wall Time (s)'),
+    # ═══════════════════════════════════════════════════════════════════
+    # Figure 1 — Time-based metrics (2×3 grid, 5 panels)
+    # ═══════════════════════════════════════════════════════════════════
+    TIME_METRICS = [
+        ('makespan',            'Makespan'),
+        ('total_flow_time',     'Total Flow Time'),
+        ('total_waiting_time',  'Total Waiting Time'),
+        ('avg_flow_time',       'Avg Flow Time'),
+        ('machine_utilization', 'Machine Utilization (∑p / Cmax)'),
     ]
-    for col, (metric, metric_title) in enumerate(metrics_display):
-        ax = axes_flat[col]
-        for s in strategies:
-            vals = [averages[i][s][metric] for i in range(n_scales)]
-            ax.plot(x_pos, vals, marker='o', markersize=7,
-                    color=COLORS[s], linewidth=2.2, alpha=0.9,
-                    label=DISPLAY_NAMES[s])
-        ax.set_title(metric_title, fontsize=12, fontweight='bold')
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels(x_labels, fontsize=9)
-        ax.set_xlabel('Number of Jobs', fontsize=9)
-        ax.grid(alpha=0.3)
 
-    handles, labels = axes_flat[0].get_legend_handles_labels()
-    fig.legend(handles, labels, fontsize=8, ncol=len(strategies),
-               loc='lower center', bbox_to_anchor=(0.5, -0.02))
-    fig.suptitle(f'Average Metrics by Scale Level ({N_SEEDS} seeds)',
-                 fontsize=14, fontweight='bold')
-    fig.tight_layout(rect=[0, 0.06, 1, 1])
-    out_path = os.path.join(out_dir, 'scale_comparison_lines.png')
-    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    fig1, axes1 = plt.subplots(2, 3, figsize=(18, 10))
+    _draw_grid(axes1.flatten(), TIME_METRICS, strategies, averages,
+               n_scales, x_pos, x_labels)
+    handles, labels = axes1[0, 0].get_legend_handles_labels()
+    fig1.legend(handles, labels, fontsize=8, ncol=len(strategies),
+                loc='lower center', bbox_to_anchor=(0.5, -0.02))
+    fig1.suptitle('Time-Based Metrics', fontsize=14, fontweight='bold')
+    fig1.tight_layout(rect=[0, 0.06, 1, 1])
+    fig1.savefig(os.path.join(out_dir, 'fig1_time_based.png'),
+                 dpi=150, bbox_inches='tight')
+    plt.close(fig1)
 
-    # ── scatter: Wall Time × Penalty, 2×2 grid ──
-    SCATTER_MARKERS = {'PA': 'P', 'LBU': 'D', 'FIFO': 's', 'EDD': 'D', 'ATC': '^',
-                       'Clairvoyant': '*'}
+    # ═══════════════════════════════════════════════════════════════════
+    # Figure 2 — Quality-based metrics (2×3 grid, 5 panels)
+    # ═══════════════════════════════════════════════════════════════════
+    QUALITY_METRICS = [
+        ('max_tardiness', 'Max Tardiness'),
+        ('avg_tardiness', 'Avg Tardiness'),
+        ('max_earliness', 'Max Earliness'),
+        ('avg_earliness', 'Avg Earliness'),
+        ('total_penalty', 'Total Penalty'),
+    ]
 
-    fig_s, axes_s = plt.subplots(2, 2, figsize=(14, 10))
-    axes_s_flat = axes_s.flatten()
-    for extra in range(n_scales, 4):
-        axes_s_flat[extra].set_visible(False)
+    fig2, axes2 = plt.subplots(2, 3, figsize=(18, 10))
+    _draw_grid(axes2.flatten(), QUALITY_METRICS, strategies, averages,
+               n_scales, x_pos, x_labels)
+    handles, labels = axes2[0, 0].get_legend_handles_labels()
+    fig2.legend(handles, labels, fontsize=8, ncol=len(strategies),
+                loc='lower center', bbox_to_anchor=(0.5, -0.02))
+    fig2.suptitle('Quality-Based Metrics', fontsize=14, fontweight='bold')
+    fig2.tight_layout(rect=[0, 0.06, 1, 1])
+    fig2.savefig(os.path.join(out_dir, 'fig2_quality_based.png'),
+                 dpi=150, bbox_inches='tight')
+    plt.close(fig2)
 
-    for si, (ax, jc) in enumerate(zip(axes_s_flat, job_counts)):
-        for s in strategies:
-            xs = [all_raw[si][seed][s]['time'] for seed in range(N_SEEDS)]
-            ys = [all_raw[si][seed][s]['penalty'] for seed in range(N_SEEDS)]
-            ax.scatter(xs, ys, c=COLORS[s], marker=SCATTER_MARKERS[s],
-                       label=DISPLAY_NAMES[s], s=50, edgecolors='white',
-                       linewidth=0.3, alpha=0.85, zorder=3)
-        ax.set_title(f'{jc} Jobs', fontsize=11, fontweight='bold')
-        ax.set_xlabel('Wall Time (s)', fontsize=9)
-        ax.set_ylabel('Total Penalty', fontsize=9)
-        ax.grid(alpha=0.3)
+    # ═══════════════════════════════════════════════════════════════════
+    # Figure 3 — Resilience metrics (1×2 grid, 2 panels)
+    # ═══════════════════════════════════════════════════════════════════
+    RESILIENCE_METRICS = [
+        ('schedule_deviation', 'Schedule Deviation (unit changes / n_ops)'),
+        ('sequence_deviation', 'Sequence Deviation (pairwise order reversals)'),
+    ]
 
-    handles, labels = axes_s_flat[0].get_legend_handles_labels()
-    fig_s.legend(handles, labels, fontsize=7, ncol=7,
-                 loc='upper center', bbox_to_anchor=(0.5, 0.02))
-    fig_s.suptitle('Time–Quality Trade-off: Wall Time vs Penalty (per seed)',
-                   fontsize=13, fontweight='bold')
-    fig_s.tight_layout()
-    path_s = os.path.join(out_dir, 'scale_scatter_time_vs_penalty.png')
-    fig_s.savefig(path_s, dpi=150, bbox_inches='tight')
+    fig3, axes3 = plt.subplots(1, 2, figsize=(14, 5))
+    _draw_grid(axes3.flatten(), RESILIENCE_METRICS, strategies,
+               averages, n_scales, x_pos, x_labels)
+    handles, labels = axes3[0].get_legend_handles_labels()
+    fig3.legend(handles, labels, fontsize=8, ncol=len(strategies),
+                loc='lower center', bbox_to_anchor=(0.5, -0.04))
+    fig3.suptitle('Resilience Metrics  (reference = Clairvoyant)',
+                  fontsize=14, fontweight='bold')
+    fig3.tight_layout(rect=[0, 0.08, 1, 1])
+    fig3.savefig(os.path.join(out_dir, 'fig3_resilience.png'),
+                 dpi=150, bbox_inches='tight')
+    plt.close(fig3)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Figure 4 — Computation efficiency (bar chart, single panel)
+    # ═══════════════════════════════════════════════════════════════════
+    fig4, ax4 = plt.subplots(figsize=(10, 5))
+    bar_width = 0.12
+    for i, s in enumerate(strategies):
+        vals = [averages[si][s]['time'] for si in range(n_scales)]
+        offset = (i - len(strategies) / 2 + 0.5) * bar_width
+        ax4.bar(x_pos + offset, vals, bar_width,
+                color=COLORS[s], label=DISPLAY_NAMES[s], alpha=0.9)
+
+    ax4.set_title('Computation Time', fontsize=14, fontweight='bold')
+    ax4.set_xticks(x_pos)
+    ax4.set_xticklabels(x_labels, fontsize=10)
+    ax4.set_xlabel('Number of Jobs', fontsize=10)
+    ax4.set_ylabel('Wall Time (s)', fontsize=10)
+    ax4.legend(fontsize=8, ncol=len(strategies))
+    ax4.grid(alpha=0.3, axis='y')
+    fig4.tight_layout()
+    fig4.savefig(os.path.join(out_dir, 'fig4_computation.png'),
+                 dpi=150, bbox_inches='tight')
+    plt.close(fig4)
 
     print(f"\nCharts saved to '{out_dir}/'")
     plt.close('all')

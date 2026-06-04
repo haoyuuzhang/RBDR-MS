@@ -172,10 +172,11 @@ def _make_job(
         operations.append(Operation(jid, idx, mtype, unit_times))
         total_min_time += min(unit_times.values())
 
-    # Due-date: random tightness (biased toward loose to create earliness-penalty jobs)
+    # Due-date: random tightness (biased toward tight/medium so tardiness-
+    # dominated jobs are well represented alongside earliness-biased ones)
     tightness = rng.choices(
         ['tight', 'medium', 'loose', 'very_loose'],
-        weights=[0.15, 0.25, 0.40, 0.20],
+        weights=[0.35, 0.30, 0.20, 0.15],
         k=1,
     )[0]
     if tightness == 'tight':
@@ -189,28 +190,37 @@ def _make_job(
 
     due_date = round(max(release, arrival) + total_min_time * dd_factor, 1)
 
-    # Penalty weights
-    # alpha (earliness) — higher for jobs with wide due-date windows:
-    #   finishing way early when you had plenty of time wastes resources.
-    #   Designed so that PA shop rule can exploit the V-shaped penalty curve.
+    # Penalty weights — symmetric mirrored design.
+    # Both α (earliness) and β (tardiness) share the same [0–8] numeric scale,
+    # with 5 mirrored slack tiers so the ranges are consistent.
+    #
+    #   Slack tier          α (earliness)      β (tardiness)       Emphasis
+    #   ──────────          ──────────────      ─────────────       ────────
+    #   Very loose  > 3.0   {5, 6, 7, 8}       {0, 1, 2, 3}       strong earliness
+    #   Loose       > 2.2   {3, 4, 5, 6}       {1, 2, 3, 4}       mild earliness
+    #   Moderate    > 1.5   {2, 3, 4, 5}       {2, 3, 4, 5}       balanced
+    #   Medium      > 1.1   {1, 2, 3, 4}       {3, 4, 5, 6}       mild tardiness
+    #   Tight       ≤ 1.1   {0, 1, 2, 3}       {5, 6, 7, 8}       strong tardiness
+    #
+    # Adjacent tiers are mirror images (Very loose ↔ Tight, Loose ↔ Medium);
+    # Moderate is self-mirror.  Every job still has randomness within its tier,
+    # so individual jobs vary naturally in how strongly they lean one way.
     slack_ratio = (due_date - max(release, arrival)) / max(total_min_time, 0.1)
-    if slack_ratio > 3.0:          # very loose due-date → dominant earliness penalty
-        alpha = rng.choice([4, 5, 6, 7, 8])
-    elif slack_ratio > 2.2:        # loose due-date → high earliness penalty
+    if slack_ratio > 3.0:          # very loose due-date → strong earliness penalty
+        alpha = rng.choice([5, 6, 7, 8])
+        beta  = rng.choice([0, 1, 2, 3])
+    elif slack_ratio > 2.2:        # loose due-date → mild earliness penalty
+        alpha = rng.choice([3, 4, 5, 6])
+        beta  = rng.choice([1, 2, 3, 4])
+    elif slack_ratio > 1.5:        # moderately loose → balanced
         alpha = rng.choice([2, 3, 4, 5])
-    elif slack_ratio > 1.5:        # moderately loose
+        beta  = rng.choice([2, 3, 4, 5])
+    elif slack_ratio > 1.1:        # medium window → mild tardiness penalty
         alpha = rng.choice([1, 2, 3, 4])
-    elif slack_ratio > 1.1:        # medium window
+        beta  = rng.choice([3, 4, 5, 6])
+    else:                           # tight window → strong tardiness penalty
         alpha = rng.choice([0, 1, 2, 3])
-    else:                           # tight window
-        alpha = rng.choice([0, 1, 2])
-
-    # beta (tardiness) — range narrowed relative to alpha so that earliness
-    # can dominate for loose jobs (α ≫ β creates the V-shape that PA exploits)
-    if slack_ratio > 2.2:
-        beta = rng.choice([1, 2, 3])
-    else:
-        beta = rng.choice([1, 2, 3, 4, 5])
+        beta  = rng.choice([5, 6, 7, 8])
 
     return Job(
         job_id=jid,

@@ -46,16 +46,19 @@ class ClairvoyantMILPStrategy(BaseStrategy):
         if not self._plan_valid:
             return self._greedy_ect(machine_id, unit, ready_ops)
 
+        # Follow the plan's unit assignment and machine sequence.
+        # Do NOT enforce MILP-planned start times: the MILP builds
+        # TRANSPORT_TIME into its precedence gaps, and the simulation
+        # engine independently adds TRANSPORT_TIME.  Enforcing start
+        # times would double-count transport, causing a systematic +2.0
+        # time-unit shift for every operation after the first in each job.
+        #
+        # The PWL breakpoints include all disruption boundaries, making
+        # duration calculations exact at any start time — so starting at
+        # a slightly different time than planned does not degrade accuracy.
         result = self._lookup_plan(machine_id, self._plan)
         if result is not None:
-            jid, oidx, unit_name, duration = result
-            # Enforce MILP-planned start time — don't start early, or the
-            # disruption-aware PWL durations computed by the solver won't
-            # match the simulation's _adjusted_duration.
-            planned_start = self._plan[(jid, oidx, machine_id)].start_time
-            if current_time < planned_start - 1e-6:
-                return None  # wait until the planned start time
-            return result  # start at (or after) the planned time
+            return result  # start immediately — plan gives unit + sequence
 
         if self._has_future_entry(machine_id):
             return None

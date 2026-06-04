@@ -51,6 +51,7 @@ class SimulationEngine:
         machines: Dict[str, MachineConfig],
         strategy,
         disruptions: Optional[List[Disruption]] = None,
+        idle_timeout: float = 0.5,
     ):
         self.env = simpy.Environment()
 
@@ -68,7 +69,8 @@ class SimulationEngine:
         self.visible_jobs: List[Job] = []
         self.machine_factors: Dict[str, float] = {m: 1.0 for m in machines}
         self._idle_rounds = 0
-        self._max_idle_rounds = 20000  # safety: prevent infinite idle loops (covers ~10000 time units / 0.5s polling)
+        self._idle_timeout = idle_timeout
+        self._max_idle_rounds = int(10000 / idle_timeout)  # safety cap: ~10000 time units of idle
         self._job_last_unit: Dict[int, str] = {}  # job_id -> unit of last completed op
 
         # For tracking in-progress ops (used by disruption handler)
@@ -175,7 +177,7 @@ class SimulationEngine:
                 self._idle_rounds += 1
                 if self._idle_rounds >= self._max_idle_rounds:
                     return
-                yield self.env.timeout(0.5)
+                yield self.env.timeout(self._idle_timeout)
                 continue
 
             self._idle_rounds = 0  # reset — productive round
