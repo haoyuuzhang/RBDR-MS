@@ -158,23 +158,6 @@ def run_experiments() -> Optional[dict]:
     cmax_C = max(e.end_time for e in sched_C)
     print(f"  OK  C_max = {cmax_C:.3f}    (solve time {dt_C:.1f} s)")
 
-    # ── Summary ──────────────────────────────────────────────────────────
-    print("\n" + "-" * 72)
-    print("  Summary  (all solved at t=0)")
-    print("-" * 72)
-    print(f"  Baseline A  (J1-J8 only)                    C_max = {cmax_A:7.3f}")
-    print(f"  Baseline B  (J1-J10 clairvoyant)            C_max = {cmax_B:7.3f}")
-    print(f"  Baseline C  (J1-J10 + M3 dead at t=6)       C_max = {cmax_C:7.3f}")
-    gap_BA = cmax_B - cmax_A
-    gap_CB = cmax_C - cmax_B
-    gap_CA = cmax_C - cmax_A
-    print(f"  Delta (B-A)  impact of J9, J10 arrivals     = {gap_BA:7.3f}")
-    print(f"  Delta (C-B)  impact of M3 breakdown          = {gap_CB:7.3f}")
-    print(f"  Delta (C-A)  total impact of all events      = {gap_CA:7.3f}")
-    print("-" * 72)
-
-    # ── Assemble result dict ─────────────────────────────────────────────
-
     def _serialise_schedule(schedule: List[ScheduleEntry]) -> list:
         """Convert a list of ScheduleEntry to a JSON-serialisable list."""
         return [asdict(e) for e in schedule]
