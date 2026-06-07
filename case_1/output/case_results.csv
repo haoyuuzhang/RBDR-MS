@@ -40,7 +40,7 @@ J3,2,M2_U1,U1,32.0,56.0,24.0,planned
 J3,3,M1_U1,U1,56.0,68.0,12.0,planned
 J4,1,M3_U1,U1,48.0,60.0,12.0,planned
 J4,2,M1_U2,U2,62.0,74.0,12.0,planned
-J4,3,M2_U1,U1,80.0,96.0,16.0,planned
+J4,3,M2_U2,U2,80.0,96.0,16.0,planned
 
 === Exp2: After M1_U2 Disruption (t=60) ===
 job_id,completion_Cj,due_date_dj,earliness_Ej,tardiness_Tj,penalty
