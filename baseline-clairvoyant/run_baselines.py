@@ -17,18 +17,21 @@ Three baselines are computed, all solved at t=0 with increasing information:
 
 Output
 ------
-  output/fig_gurobi_baselines.png   — 3-panel Gantt chart
+  output/baseline_results.json        — cached experiment results
+  output/fig_gurobi_baselines.png     — 3-panel Gantt chart
   Console summary with C_max values and solver statistics.
 
 Usage
 -----
-  python baseline-pure-2-stage/run_baselines.py
+  python baseline-clairvoyant/run_baselines.py
 """
 
 import json
 import os
 import sys
 import time
+from dataclasses import asdict
+from typing import List, Optional
 
 # Support running as a plain script (the directory name has hyphens -> not a
 # valid Python package, so we add it to sys.path instead of using relative
@@ -41,13 +44,15 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
 
-from models import Job, Operation
+from models import Job, Operation, ScheduleEntry
 from scheduler import schedule_makespan_milp
 from plotting import plot_gantt, job_color, job_label
 
 OUTPUT_DIR = os.path.join(_HERE, "output")
 DATA_PATH = os.path.join(_HERE, "kacem_data.json")
+CACHE_PATH = os.path.join(OUTPUT_DIR, "baseline_results.json")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -76,10 +81,18 @@ def load_data() -> tuple:
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#  Main
+#  Experiment runner
 # ═════════════════════════════════════════════════════════════════════════
 
-def main():
+def run_experiments() -> Optional[dict]:
+    """Run the three Gurobi MILP baselines.
+
+    Returns a dict with keys ``"baselines"`` (A/B/C → cmax + schedule) and
+    ``"metadata"`` (disruption info), or ``None`` if any solve fails.
+
+    The result is also cached to *output/baseline_results.json* so the
+    plotting stage can be iterated on without re-solving.
+    """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     initial_jobs, dynamic_jobs, disruptions = load_data()
@@ -105,7 +118,7 @@ def main():
 
     if sched_A is None:
         print("  !! Gurobi unavailable or MILP infeasible -- cannot proceed.")
-        return
+        return None
 
     cmax_A = max(e.end_time for e in sched_A)
     print(f"  OK  C_max = {cmax_A:.3f}    (solve time {dt_A:.1f} s)")
@@ -120,7 +133,7 @@ def main():
 
     if sched_B is None:
         print("  !! MILP failed -- cannot proceed.")
-        return
+        return None
 
     cmax_B = max(e.end_time for e in sched_B)
     print(f"  OK  C_max = {cmax_B:.3f}    (solve time {dt_B:.1f} s)")
@@ -140,7 +153,7 @@ def main():
 
     if sched_C is None:
         print("  !! MILP failed -- cannot proceed.")
-        return
+        return None
 
     cmax_C = max(e.end_time for e in sched_C)
     print(f"  OK  C_max = {cmax_C:.3f}    (solve time {dt_C:.1f} s)")
@@ -160,10 +173,71 @@ def main():
     print(f"  Delta (C-A)  total impact of all events      = {gap_CA:7.3f}")
     print("-" * 72)
 
+    # ── Assemble result dict ─────────────────────────────────────────────
+
+    def _serialise_schedule(schedule: List[ScheduleEntry]) -> list:
+        """Convert a list of ScheduleEntry to a JSON-serialisable list."""
+        return [asdict(e) for e in schedule]
+
+    results = {
+        "baselines": {
+            "A": {"cmax": cmax_A, "entries": _serialise_schedule(sched_A)},
+            "B": {"cmax": cmax_B, "entries": _serialise_schedule(sched_B)},
+            "C": {"cmax": cmax_C, "entries": _serialise_schedule(sched_C)},
+        },
+        "metadata": {
+            "disrupted_machine": disrupted_machine,
+            "disruption_time": disruption_time,
+        },
+    }
+
+    with open(CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+    print(f"  Cached results ->  {CACHE_PATH}")
+
+    return results
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Plotting
+# ═════════════════════════════════════════════════════════════════════════
+
+def plot_results(results: dict) -> None:
+    """Generate the 3-panel Gantt chart from experiment results.
+
+    Parameters
+    ----------
+    results : dict
+        The dict returned by :func:`run_experiments`, or loaded from the
+        JSON cache file.
+    """
+    baselines = results["baselines"]
+    meta = results["metadata"]
+
+    def _deserialise_schedule(entries: list) -> List[ScheduleEntry]:
+        """Reconstruct ScheduleEntry objects from a list of plain dicts."""
+        return [ScheduleEntry(**e) for e in entries]
+
+    sched_A = _deserialise_schedule(baselines["A"]["entries"])
+    sched_B = _deserialise_schedule(baselines["B"]["entries"])
+    sched_C = _deserialise_schedule(baselines["C"]["entries"])
+
+    cmax_A = baselines["A"]["cmax"]
+    cmax_B = baselines["B"]["cmax"]
+    cmax_C = baselines["C"]["cmax"]
+
+    disrupted_machine = meta["disrupted_machine"]
+    disruption_time = meta["disruption_time"]
+
     # ═════════════════════════════════════════════════════════════════════
-    #  3-Panel Gantt Chart  (shared legend at top, no per-panel legend)
+    #  3-Panel Gantt Chart  (row 1: A full-width; row 2: B | C)
+    #  Shared legend at top, no per-panel legend.
     # ═════════════════════════════════════════════════════════════════════
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(18, 20))
+    fig = plt.figure(figsize=(24, 16))
+    gs = GridSpec(2, 4, figure=fig)
+    ax1 = fig.add_subplot(gs[0, 1:3])   # top row, centered (same width as B/C)
+    ax2 = fig.add_subplot(gs[1, 0:2])   # bottom-left
+    ax3 = fig.add_subplot(gs[1, 2:4])   # bottom-right
 
     x_max = max(cmax_A, cmax_B, cmax_C) * 1.08
 
@@ -208,15 +282,26 @@ def main():
     fig.legend(handles=legend_patches, loc='upper center',
                ncol=min(len(all_job_ids), 10), fontsize=9,
                title='Jobs', title_fontsize=10,
-               bbox_to_anchor=(0.5, 0.95))
+               bbox_to_anchor=(0.5, 0.97))
 
     fig.suptitle('Kacem 8x8  FJSP -- Gurobi MILP Optimal Baselines  (all solved at t=0)',
-                 fontsize=15, fontweight='bold', y=0.98)
-    fig.tight_layout(pad=3.5, rect=[0, 0, 1, 0.94])
+                 fontsize=15, fontweight='bold', y=0.99)
+    fig.tight_layout(pad=3.5, rect=[0, 0, 1, 0.95])
 
     out_path = os.path.join(OUTPUT_DIR, "fig_gurobi_baselines.png")
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
     print(f"\n  Gantt chart saved ->  {out_path}")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Main
+# ═════════════════════════════════════════════════════════════════════════
+
+def main():
+    # results = run_experiments()   # 注释掉，跳过 MILP
+    with open(CACHE_PATH, "r") as f:
+        results = json.load(f)
+    plot_results(results)
 
 
 if __name__ == "__main__":
