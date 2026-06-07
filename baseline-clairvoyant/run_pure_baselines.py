@@ -165,6 +165,21 @@ def _build_machine_queues(ready_ops: Set[Tuple[int, int]],
     return queues
 
 
+def _filter_scenario(jobs: List[Job],
+                     disruptions: List[dict],
+                     snapshot_time: float) -> tuple:
+    """Return (jobs, disruptions) for what is known at *snapshot_time*.
+
+    Only jobs that have already arrived and disruptions whose time has
+    already passed are included — this prevents the scheduler from
+    "seeing the future" and ensures each snapshot reflects true online
+    decision-making.
+    """
+    known_jobs = [j for j in jobs if j.arrival_time <= snapshot_time]
+    known_disruptions = [d for d in disruptions if d["time"] <= snapshot_time]
+    return known_jobs, known_disruptions
+
+
 def simulate_rule(rule_name: str,
                   jobs: List[Job],
                   disruptions: List[dict]) -> dict:
@@ -451,7 +466,7 @@ def simulate_rule(rule_name: str,
 def build_snapshot(final_entries: List[ScheduleEntry],
                    partial_entries: List[ScheduleEntry],
                    snapshot_time: float,
-                   job_arrival_times: Dict[int, float]) -> List[ScheduleEntry]:
+                   job_arrival_times: Optional[Dict[int, float]] = None) -> List[ScheduleEntry]:
     """Build the schedule as seen at a given decision point.
 
     The snapshot shows the **complete** schedule — both fixed (already
@@ -465,22 +480,12 @@ def build_snapshot(final_entries: List[ScheduleEntry],
       machine, ``fixed=True``.  The rescheduled counterpart (same job+op on
       a different machine) only appears for T >= break_time.
 
-    Jobs that have not yet arrived at the snapshot time are excluded.
-
-    Parameters
-    ----------
-    final_entries : list of ScheduleEntry
-        The full completed schedule from the simulation.
-    partial_entries : list of ScheduleEntry
-        Interrupted operations recorded during simulation.
-    snapshot_time : float
-        The decision-point time (0, 2, or 6).
-    job_arrival_times : dict
-        ``{job_id: arrival_time}`` for all jobs.
-
-    Returns
-    -------
-    list of ScheduleEntry
+    .. note::
+       The simulation that produced *final_entries* / *partial_entries*
+       should already be restricted to jobs whose ``arrival_time <=
+       snapshot_time``.  This function does **not** filter by job arrival;
+       it assumes the caller has already run a scenario-appropriate
+       simulation.
     """
     snapshot: List[ScheduleEntry] = []
 
@@ -494,11 +499,6 @@ def build_snapshot(final_entries: List[ScheduleEntry],
 
     for e in final_entries:
         key = (e.job_id, e.op_idx)
-
-        # Skip jobs that haven't arrived yet
-        arrival = job_arrival_times.get(e.job_id, 0.0)
-        if snapshot_time < arrival:
-            continue
 
         if key in interrupted_keys:
             # This final entry is a *rescheduled* version (on a new machine).
@@ -539,14 +539,8 @@ def build_snapshot(final_entries: List[ScheduleEntry],
                 ))
 
     # 2. Interrupted (partial) operations — show the failed attempt on the
-    #    broken machine.  Use the same three-way logic as normal ops so that
-    #    t=0 includes future partial ops (fixes missing J4-2 at t=0).
+    #    broken machine.
     for e in partial_entries:
-        # Skip jobs that haven't arrived yet
-        arrival = job_arrival_times.get(e.job_id, 0.0)
-        if snapshot_time < arrival:
-            continue
-
         if e.end_time <= snapshot_time:
             # Interruption already happened and is in the past
             snapshot.append(ScheduleEntry(
@@ -580,8 +574,17 @@ def build_snapshot(final_entries: List[ScheduleEntry],
 def run_experiments() -> Optional[dict]:
     """Run SPT, FIFO and WINQ simulations on the Kacem 8x8 benchmark.
 
-    Returns a dict with keys ``"rules"`` (rule_name → cmax + schedule +
-    partial_entries) and ``"metadata"``, or ``None`` on data-load failure.
+    For each rule, **three independent simulations** are executed — one
+    at each decision point — using only the information available at
+    that time (no "clairvoyance"):
+
+    * t=0 : J1-J8 only, no disruption knowledge
+    * t=2 : J1-J10,    no disruption knowledge
+    * t=6 : J1-J10 + M3 breakdown
+
+    Returns a dict with keys ``"rules"`` (rule_name → snapshot_time →
+    cmax + schedule + partial_entries) and ``"metadata"``, or ``None``
+    on data-load failure.
 
     Results are cached to *output/pure_rule_results.json*.
     """
@@ -608,32 +611,54 @@ def run_experiments() -> Optional[dict]:
     results: Dict[str, dict] = {}
 
     for rule_name in rules:
-        print(f"\n[{rule_name}]  Running simulation ...")
-        sim_result = simulate_rule(rule_name, all_jobs, disruptions)
+        print(f"\n[{rule_name}]")
+        rule_results: Dict[str, dict] = {}
 
-        cmax = sim_result["cmax"]
-        dt = sim_result["compute_time"]
-        n_entries = len(sim_result["entries"])
-        n_partial = len(sim_result["partial_entries"])
+        for t in SNAPSHOT_TIMES:
+            # ── Filter to what is known at time t ──────────────────────────
+            known_jobs, known_disruptions = _filter_scenario(
+                all_jobs, disruptions, t)
 
-        partial_str = f"  partial (interrupted) = {n_partial}" if n_partial else ""
-        print(f"  OK  C_max = {cmax:.3f}    "
-              f"compute_time = {dt*1000:.1f} ms    "
-              f"ops scheduled = {n_entries}"
-              f"{'  |  ' + partial_str if partial_str else ''}")
+            sim_result = simulate_rule(rule_name, known_jobs, known_disruptions)
 
-        results[rule_name] = sim_result
+            cmax = sim_result["cmax"]
+            dt = sim_result["compute_time"]
+            n_entries = len(sim_result["entries"])
+            n_partial = len(sim_result["partial_entries"])
+
+            partial_str = f"  partial (interrupted) = {n_partial}" if n_partial else ""
+            n_jobs = len(known_jobs)
+            print(f"  t={t:.0f}  |  {n_jobs:2d} jobs  |  "
+                  f"C_max = {cmax:7.3f}  |  "
+                  f"compute = {dt*1000:5.1f} ms  |  "
+                  f"ops scheduled = {n_entries}"
+                  f"{'  |  ' + partial_str if partial_str else ''}")
+
+            rule_results[str(t)] = sim_result
+
+        results[rule_name] = rule_results
 
     # ── Summary ─────────────────────────────────────────────────────────
     print("\n" + "-" * 72)
-    print("  Summary  (single-level rule-based, dynamic simulation)")
+    print("  Summary  (single-level rule-based, per-decision-point simulation)")
     print("-" * 72)
+    header = f"  {'Rule':6s}"
+    for t in SNAPSHOT_TIMES:
+        header += f"    {'t=' + str(int(t)):>8s}"
+    header += f"    {'Jobs':>5s}"
+    print(header)
+    print("  " + "-" * (6 + len(SNAPSHOT_TIMES) * 13 + 6))
     for rule_name in rules:
-        n_partial = len(results[rule_name].get("partial_entries", []))
+        line = f"  {rule_name:6s}"
+        for t in SNAPSHOT_TIMES:
+            line += f"    {results[rule_name][str(t)]['cmax']:8.3f}"
+        t_key = str(SNAPSHOT_TIMES[-1])
+        n_partial = len(results[rule_name][t_key].get("partial_entries", []))
         partial_note = f"  [{n_partial} interrupted]" if n_partial else ""
-        print(f"  {rule_name:6s}    C_max = {results[rule_name]['cmax']:7.3f}   "
-              f"({results[rule_name]['compute_time']*1000:6.1f} ms)"
-              f"{'  ' + partial_note if partial_note else ''}")
+        line += f"    {results[rule_name][t_key]['compute_time']*1000:5.0f}ms"
+        if partial_note:
+            line += f"  {partial_note}"
+        print(line)
     print("-" * 72)
 
     # Load Gurobi baselines for comparison (if available)
@@ -656,6 +681,7 @@ def run_experiments() -> Optional[dict]:
             "num_jobs": len(all_jobs),
             "num_machines": len(ALL_MACHINES),
             "job_arrival_times": job_arrival_times,
+            "snapshot_times": SNAPSHOT_TIMES,
         },
     }
 
@@ -674,43 +700,51 @@ def _plot_one_rule(rule_name: str,
                    rule_data: dict,
                    disruptions: List[dict],
                    snapshot_times: List[float],
-                   job_arrival_times: Dict[int, float]) -> None:
+                   job_arrival_times: Optional[Dict[int, float]] = None) -> None:
     """Generate a single figure with 3 snapshot Gantt panels for one rule.
+
+    Each panel is drawn from an **independent** simulation that only knew
+    the jobs and disruptions whose time ``<=`` the snapshot time.
 
     Parameters
     ----------
     rule_name : str
         ``'SPT'``, ``'FIFO'``, or ``'WINQ'``.
     rule_data : dict
-        Must contain ``'entries'``, ``'partial_entries'``, ``'cmax'``,
-        ``'compute_time'``.
+        ``{str(snapshot_time): {cmax, entries, partial_entries, compute_time}}``
     disruptions : list of dict
+        All disruptions (for the figure-level annotation).
     snapshot_times : list of float
         Decision-point times (typically [0, 2, 6]).
-    job_arrival_times : dict
-        ``{job_id: arrival_time}`` for all jobs.
+    job_arrival_times : dict, optional
+        Kept for backward compatibility; no longer used.
     """
-    final_entries = [ScheduleEntry(**e) for e in rule_data["entries"]]
-    partial_entries = [ScheduleEntry(**e) for e in rule_data.get("partial_entries", [])]
-    cmax = rule_data["cmax"]
-    dt = rule_data["compute_time"]
+    # ── Per-snapshot results ────────────────────────────────────────────
+    snapshots: List[List[ScheduleEntry]] = []
+    cmax_list: List[float] = []
+    all_job_ids: Set[int] = set()
 
-    # Build snapshots
-    snapshots = [build_snapshot(final_entries, partial_entries, t, job_arrival_times)
-                 for t in snapshot_times]
+    for t in snapshot_times:
+        key = str(t)
+        sim = rule_data[key]
+        final_entries = [ScheduleEntry(**e) for e in sim["entries"]]
+        partial_entries = [ScheduleEntry(**e) for e in sim.get("partial_entries", [])]
 
-    # Determine job IDs present (including partial ops)
-    all_job_ids = sorted({e.job_id for s in snapshots for e in s})
-    hl_set = {9, 10} if any(jid >= 9 for jid in all_job_ids) else set()
+        snap_sched = build_snapshot(final_entries, partial_entries, t)
+        snapshots.append(snap_sched)
+        cmax_list.append(sim["cmax"])
+        all_job_ids.update(e.job_id for e in snap_sched)
 
-    # Disruption annotation
+    all_job_ids_sorted = sorted(all_job_ids)
+
+    # ── Global x-limit: max of all three scenario makespans ──────────────
+    x_max = max(cmax_list) * 1.10 if max(cmax_list) > 0 else 30
+
+    # ── Disruption annotation ────────────────────────────────────────────
     disruption_str = ""
     if disruptions:
         d = disruptions[0]
         disruption_str = f"  |  {d['machine']} breakdown at t={d['time']:.0f}"
-
-    # Global x-limit: use the full cmax, plus 10% margin
-    x_max = cmax * 1.10 if cmax > 0 else 30
 
     # ═════════════════════════════════════════════════════════════════════
     #  Figure: 1 row × 3 columns  (t=0 | t=2 | t=6)
@@ -725,10 +759,16 @@ def _plot_one_rule(rule_name: str,
 
     for i, (t, snap_sched, ax) in enumerate(zip(snapshot_times, snapshots, axes)):
         n_fixed = sum(1 for e in snap_sched if e.fixed)
+        cmax_i = cmax_list[i]
+        dt_i = rule_data[str(t)]["compute_time"]
+
+        # Highlight J9/J10 only when they exist in this scenario
+        hl_set = {9, 10} if any(jid >= 9 for jid in (e.job_id for e in snap_sched)) else set()
+
         panel_title = (
             f'{rule_name}  —  {snapshot_labels[i]}\n'
             f'({n_fixed} ops fixed  |  '
-            f'C_max (full) = {cmax:.3f},  compute = {dt*1000:.1f} ms)'
+            f'C_max = {cmax_i:.3f},  compute = {dt_i*1000:.1f} ms)'
         )
         plot_gantt(snap_sched, panel_title,
                    current_time=t,
@@ -739,9 +779,11 @@ def _plot_one_rule(rule_name: str,
 
     # ── Shared figure-level legend ──────────────────────────────────────
     legend_patches = []
-    for jid in all_job_ids:
+    for jid in all_job_ids_sorted:
         label = f"{job_label(jid)} (Job {jid})"
-        if jid in hl_set:
+        # Highlight J9/J10 if they're in the job set
+        hl_set_global = {9, 10} if any(jid >= 9 for jid in all_job_ids_sorted) else set()
+        if jid in hl_set_global:
             legend_patches.append(mpatches.Patch(
                 facecolor=job_color(jid), label=label,
                 edgecolor='black', linewidth=2.0))
@@ -749,7 +791,7 @@ def _plot_one_rule(rule_name: str,
             legend_patches.append(mpatches.Patch(
                 facecolor=job_color(jid), label=label))
     fig.legend(handles=legend_patches, loc='upper center',
-               ncol=min(len(all_job_ids), 10), fontsize=9,
+               ncol=min(len(all_job_ids_sorted), 10), fontsize=9,
                title='Jobs', title_fontsize=10,
                bbox_to_anchor=(0.5, 0.99))
 
@@ -773,6 +815,9 @@ def plot_results(results: dict) -> None:
     For each rule (SPT / FIFO / WINQ), produces a figure with panels at
     t=0, t=2, t=6 showing the schedule state at that decision point.
 
+    Each panel is drawn from an **independent** simulation that only had
+    access to the information available at that decision point.
+
     Parameters
     ----------
     results : dict
@@ -782,17 +827,12 @@ def plot_results(results: dict) -> None:
     rules_data = results["rules"]
     meta = results["metadata"]
     disruptions = meta.get("disruptions", [])
-    # JSON serialises int dict keys as strings — convert back
-    raw_arrivals = meta.get("job_arrival_times", {})
-    job_arrival_times: Dict[int, float] = {
-        int(k): float(v) for k, v in raw_arrivals.items()
-    }
 
     print("\n  Generating snapshot Gantt charts ...")
 
     for rule_name in ["SPT", "FIFO", "WINQ"]:
         _plot_one_rule(rule_name, rules_data[rule_name],
-                       disruptions, SNAPSHOT_TIMES, job_arrival_times)
+                       disruptions, SNAPSHOT_TIMES)
 
     print("  All charts generated.\n")
 
