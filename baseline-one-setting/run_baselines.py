@@ -216,11 +216,11 @@ def plot_results(results: dict) -> None:
     #  3-Panel Gantt Chart  (row 1: A full-width; row 2: B | C)
     #  Shared legend at top, no per-panel legend.
     # ═════════════════════════════════════════════════════════════════════
-    fig = plt.figure(figsize=(24, 16))
-    gs = GridSpec(2, 4, figure=fig)
-    ax1 = fig.add_subplot(gs[0, 1:3])   # top row, centered (same width as B/C)
-    ax2 = fig.add_subplot(gs[1, 0:2])   # bottom-left
-    ax3 = fig.add_subplot(gs[1, 2:4])   # bottom-right
+    fig = plt.figure(figsize=(24, 8))
+    gs = GridSpec(1, 3, figure=fig)
+    ax1 = fig.add_subplot(gs[0, 0])   # left: Baseline A
+    ax2 = fig.add_subplot(gs[0, 1])   # middle: Baseline B
+    ax3 = fig.add_subplot(gs[0, 2])   # right: Baseline C
 
     x_max = max(cmax_A, cmax_B, cmax_C) * 1.08
 
@@ -232,8 +232,7 @@ def plot_results(results: dict) -> None:
     ax1.set_xlim(0, x_max)
 
     plot_gantt(sched_B,
-               f'Baseline B -- Clairvoyant Schedule  (J1-J10 all known at t=0, '
-               f'J9/J10 released t=2)\n'
+               f'Baseline B -- Clairvoyant Schedule  (J1-J10 all known at t=0)\n'
                f'C_max = {cmax_B:.3f}',
                highlight_jobs={9, 10}, show_legend=False,
                ax=ax2)

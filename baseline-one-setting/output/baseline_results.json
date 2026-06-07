@@ -219,7 +219,8 @@
           "end_time": 14.0,
           "fixed": false
         }
-      ]
+      ],
+      "compute_time": 1.0393882000003032
     },
     "B": {
       "cmax": 14.0,
@@ -480,7 +481,8 @@
           "end_time": 14.0,
           "fixed": false
         }
-      ]
+      ],
+      "compute_time": 9.736764100000073
     },
     "C": {
       "cmax": 15.0,
@@ -741,7 +743,8 @@
           "end_time": 15.0,
           "fixed": false
         }
-      ]
+      ],
+      "compute_time": 7.3113508000001275
     }
   },
   "metadata": {
