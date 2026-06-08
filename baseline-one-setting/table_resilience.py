@@ -30,6 +30,30 @@ def fmt_pct(v: float) -> str:
         return " 0.00%"
 
 
+def count_machine_changes(entries_before, entries_after):
+    """Count operations (and unique jobs) whose assigned machine changed
+    between two schedule snapshots.
+
+    Only operations that appear in *both* snapshots are compared — newly
+    arrived jobs that have no counterpart in the earlier snapshot are
+    naturally excluded because the perturbation is about *reassignment*,
+    not about the size of the new work.
+    """
+    before_map = {}  # (job_id, op_idx) -> machine
+    for e in entries_before:
+        before_map[(e["job_id"], e["op_idx"])] = e["machine"]
+
+    changed_ops = 0
+    changed_jobs = set()
+    for e in entries_after:
+        key = (e["job_id"], e["op_idx"])
+        if key in before_map and before_map[key] != e["machine"]:
+            changed_ops += 1
+            changed_jobs.add(e["job_id"])
+
+    return changed_ops, len(changed_jobs)
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -59,15 +83,16 @@ def main():
         excess_deg1 = deg1 - bl_deg1
         excess_deg2 = deg2 - bl_deg2
 
-        # Stage 1: J9+J10 insertion
-        # J9 has 2 ops, J10 has 3 ops -> 5 new operations, 2 new jobs
-        affected_ops_s1 = 5
-        affected_jobs_s1 = 2
+        # Stage 1: J9+J10 insertion → machine reassignments (t=0 vs t=2)
+        entries_t0 = r["0.0"]["entries"]
+        entries_t2 = r["2.0"]["entries"]
+        affected_ops_s1, affected_jobs_s1 = count_machine_changes(
+            entries_t0, entries_t2)
 
-        # Stage 2: M3 breakdown -> interrupted ops from partial_entries
-        partial = r["6.0"].get("partial_entries", [])
-        interrupted_ops = len(partial)
-        interrupted_jobs = len(set(p["job_id"] for p in partial))
+        # Stage 2: M3 breakdown → machine reassignments (t=2 vs t=6)
+        entries_t6 = r["6.0"]["entries"]
+        affected_ops_s2, affected_jobs_s2 = count_machine_changes(
+            entries_t2, entries_t6)
 
         rules_data[rule_name] = {
             "deg1": deg1,
@@ -76,8 +101,8 @@ def main():
             "excess_deg2": excess_deg2,
             "affected_ops_s1": affected_ops_s1,
             "affected_jobs_s1": affected_jobs_s1,
-            "interrupted_ops": interrupted_ops,
-            "interrupted_jobs": interrupted_jobs,
+            "interrupted_ops": affected_ops_s2,
+            "interrupted_jobs": affected_jobs_s2,
         }
 
     # -- Bi-level metrics ---------------------------------------------------
@@ -98,12 +123,16 @@ def main():
             excess_deg1 = deg1 - bl_deg1
             excess_deg2 = deg2 - bl_deg2
 
-            affected_ops_s1 = 5   # J9: 2 ops, J10: 3 ops
-            affected_jobs_s1 = 2
+            # Machine reassignments — compare snapshot schedules
+            ss = r.get("snapshot_schedules", {})
+            entries_t0 = ss.get("0.0", [])
+            entries_t2 = ss.get("2.0", [])
+            entries_t6 = ss.get("6.0", [])
 
-            partial = r.get("partial_entries", [])
-            interrupted_ops = len(partial)
-            interrupted_jobs = len(set(p["job_id"] for p in partial))
+            affected_ops_s1, affected_jobs_s1 = count_machine_changes(
+                entries_t0, entries_t2)
+            affected_ops_s2, affected_jobs_s2 = count_machine_changes(
+                entries_t2, entries_t6)
 
             bi_level_data[rule_name] = {
                 "deg1": deg1,
@@ -112,8 +141,8 @@ def main():
                 "excess_deg2": excess_deg2,
                 "affected_ops_s1": affected_ops_s1,
                 "affected_jobs_s1": affected_jobs_s1,
-                "interrupted_ops": interrupted_ops,
-                "interrupted_jobs": interrupted_jobs,
+                "interrupted_ops": affected_ops_s2,
+                "interrupted_jobs": affected_jobs_s2,
             }
 
     # =====================================================================
@@ -131,6 +160,7 @@ def main():
         "  Deg1 = (C_max after J9+J10 insertion - C_max initial) / C_max initial  [Stage 1]",
         "  Deg2 = (C_max after M3 breakdown - C_max after insertion) / C_max after insertion  [Stage 2]",
         "  Excess Deg = Method's Deg - Optimal Deg  (positive -> more fragile)",
+        "  Chg.Ops / Chg.Jobs = ops & jobs whose assigned machine changed between snapshots",
         "",
         HL,
     ]
@@ -140,8 +170,8 @@ def main():
           f"{'--- Stage 1 (J9+J10 Insertion) ---':^52s}{SEP}"
           f"{'--- Stage 2 (M3 Breakdown) ---':^52s}")
     h2 = (f"{'':10s}{SEP}"
-          f"{'Deg1(%)':>8s}  {'Aff.Ops':>8s}  {'Aff.Jobs':>8s}  {'Exc.Deg1':>8s}{SEP}"
-          f"{'Deg2(%)':>8s}  {'Int.Ops':>8s}  {'Aff.Jobs':>8s}  {'Exc.Deg2':>8s}")
+          f"{'Deg1(%)':>8s}  {'Chg.Ops':>8s}  {'Chg.Jobs':>8s}  {'Exc.Deg1':>8s}{SEP}"
+          f"{'Deg2(%)':>8s}  {'Chg.Ops':>8s}  {'Chg.Jobs':>8s}  {'Exc.Deg2':>8s}")
 
     lines.append(h1)
     lines.append(h2)

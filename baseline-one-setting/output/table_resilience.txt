@@ -5,19 +5,26 @@ Table X: Two-Stage Perturbation Resilience
   Deg1 = (C_max after J9+J10 insertion - C_max initial) / C_max initial  [Stage 1]
   Deg2 = (C_max after M3 breakdown - C_max after insertion) / C_max after insertion  [Stage 2]
   Excess Deg = Method's Deg - Optimal Deg  (positive -> more fragile)
+  Chg.Ops / Chg.Jobs = ops & jobs whose assigned machine changed between snapshots
 
 ------------------------------------------------------------------------------------------------------------------------
 Method               --- Stage 1 (J9+J10 Insertion) ---                      --- Stage 2 (M3 Breakdown) ---           
-             Deg1(%)   Aff.Ops  Aff.Jobs  Exc.Deg1   Deg2(%)   Int.Ops  Aff.Jobs  Exc.Deg2
+             Deg1(%)   Chg.Ops  Chg.Jobs  Exc.Deg1   Deg2(%)   Chg.Ops  Chg.Jobs  Exc.Deg2
 ------------------------------------------------------------------------------------------------------------------------
 Baseline       0.00%        --        --     0.00%    +7.14%        --        --     0.00%
-SPT           -5.88%         5         2    -5.88%     0.00%         1         1    -7.14%
-FIFO         -16.22%         5         2   -16.22%   +25.81%         1         1   +18.66%
-WINQ         +13.79%         5         2   +13.79%   +15.15%         1         1    +8.01%
+SPT           -5.88%        10         6    -5.88%     0.00%        12         7    -7.14%
+FIFO         -16.22%        18         8   -16.22%   +25.81%        23        10   +18.66%
+WINQ         +13.79%        16         7   +13.79%   +15.15%        19         9    +8.01%
+
+SPT-MILP      +7.14%         9         5    +7.14%   +26.67%         9         5   +19.52%
+FIFO-MILP    +35.71%        23         8   +35.71%   +31.58%        11         7   +24.44%
+WINQ-MILP    +71.43%        27         7   +71.43%   +12.50%        15         7    +5.36%
 ------------------------------------------------------------------------------------------------------------------------
 
 Notes:
   Optimal Stage-1 degradation:  0.00%  (Baseline: cmax 14h -> 14h with J9/J10)
   Optimal Stage-2 degradation: +7.14%  (Baseline: cmax 14h -> 15h with M3 breakdown)
   Stage 1 (J9+J10) (single-level):  most resilient = FIFO (-16.22%),  most fragile = WINQ (+13.79%)
+  Stage 1 (J9+J10) (bi-level):      most resilient = SPT-MILP (+7.14%),  most fragile = WINQ-MILP (+71.43%)
   Stage 2 (M3 breakdown) (single-level):  most resilient = SPT (-7.14%),  most fragile = FIFO (+18.66%)
+  Stage 2 (M3 breakdown) (bi-level):      most resilient = WINQ-MILP (+5.36%),  most fragile = FIFO-MILP (+24.44%)
