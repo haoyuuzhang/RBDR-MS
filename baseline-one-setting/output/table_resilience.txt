@@ -12,29 +12,29 @@ Method               --- Stage 1 (J9+J10 Insertion) ---                      ---
              Deg1(%)   Chg.Ops  Chg.Jobs  Exc.Deg1   Deg2(%)   Chg.Ops  Chg.Jobs  Exc.Deg2
 ------------------------------------------------------------------------------------------------------------------------
 Baseline       0.00%        --        --     0.00%    +7.14%        --        --     0.00%
-SPT           -5.88%        10         6    -5.88%     0.00%        12         7    -7.14%
-FIFO         -16.22%        18         8   -16.22%   +25.81%        23        10   +18.66%
-WINQ         +13.79%        16         7   +13.79%   +15.15%        19         9    +8.01%
+SPT         +128.57%        12         7  +128.57%    +6.25%        12         7    -0.89%
+FIFO        +114.29%        12         8  +114.29%   +16.67%        13         9    +9.52%
+WINQ        +164.29%        11         8  +164.29%   +10.81%        12         7    +3.67%
 
-SPT-MILP      +7.14%         9         5    +7.14%   +26.67%         9         5   +19.52%
-FIFO-MILP    +35.71%        23         8   +35.71%   +31.58%        11         7   +24.44%
-WINQ-MILP    +71.43%        27         7   +71.43%   +12.50%        15         7    +5.36%
+SPT-MILP      +7.14%         5         5    +7.14%   +26.67%         7         5   +19.52%
+FIFO-MILP    +64.29%        13         7   +64.29%   +13.04%         8         7    +5.90%
+WINQ-MILP    +71.43%        14         7   +71.43%    +4.17%        10         9    -2.98%
 
 Global GA    +20.00%         1         1   +20.00%     0.00%         2         2    -7.14%
 
-SPT-GA        -7.14%         5         4    -7.14%   +30.77%         4         4   +23.63%
-FIFO-GA      +35.71%        11         8   +35.71%   +15.79%         4         4    +8.65%
-WINQ-GA      +35.71%        16         8   +35.71%   +15.79%         4         4    +8.65%
+SPT-GA       +35.71%         4         4   +35.71%   +26.32%         2         2   +19.17%
+FIFO-GA      +92.86%        14         8   +92.86%   +18.52%        13         7   +11.38%
+WINQ-GA     +107.14%        16         8  +107.14%   +13.79%         7         6    +6.65%
 ------------------------------------------------------------------------------------------------------------------------
 
 Notes:
   Optimal Stage-1 degradation:  0.00%  (Baseline: cmax 14h -> 14h with J9/J10)
   Optimal Stage-2 degradation: +7.14%  (Baseline: cmax 14h -> 15h with M3 breakdown)
-  Stage 1 (J9+J10) (single-level rules):  most resilient = FIFO (-16.22%),  most fragile = WINQ (+13.79%)
+  Stage 1 (J9+J10) (single-level rules):  most resilient = FIFO (+114.29%),  most fragile = WINQ (+164.29%)
   Stage 1 (J9+J10) (bi-level MILP):      most resilient = SPT-MILP (+7.14%),  most fragile = WINQ-MILP (+71.43%)
   Stage 1 (J9+J10) (Global GA):            excess = +20.00%
-  Stage 1 (J9+J10) (bi-level GA):         most resilient = SPT-GA (-7.14%),  most fragile = FIFO-GA (+35.71%)
-  Stage 2 (M3 breakdown) (single-level rules):  most resilient = SPT (-7.14%),  most fragile = FIFO (+18.66%)
-  Stage 2 (M3 breakdown) (bi-level MILP):      most resilient = WINQ-MILP (+5.36%),  most fragile = FIFO-MILP (+24.44%)
+  Stage 1 (J9+J10) (bi-level GA):         most resilient = SPT-GA (+35.71%),  most fragile = WINQ-GA (+107.14%)
+  Stage 2 (M3 breakdown) (single-level rules):  most resilient = SPT (-0.89%),  most fragile = FIFO (+9.52%)
+  Stage 2 (M3 breakdown) (bi-level MILP):      most resilient = WINQ-MILP (-2.98%),  most fragile = SPT-MILP (+19.52%)
   Stage 2 (M3 breakdown) (Global GA):            excess = -7.14%
-  Stage 2 (M3 breakdown) (bi-level GA):         most resilient = FIFO-GA (+8.65%),  most fragile = SPT-GA (+23.63%)
+  Stage 2 (M3 breakdown) (bi-level GA):         most resilient = WINQ-GA (+6.65%),  most fragile = SPT-GA (+19.17%)

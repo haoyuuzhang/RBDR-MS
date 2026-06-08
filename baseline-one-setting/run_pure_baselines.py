@@ -94,6 +94,111 @@ def load_data() -> tuple:
 
 
 # ═════════════════════════════════════════════════════════════════════════
+#  Rescheduling helpers
+# ═════════════════════════════════════════════════════════════════════════
+
+def _split_schedule_at_time(
+    schedule: List[ScheduleEntry],
+    current_time: float,
+    previously_fixed_keys: Optional[Set[Tuple[int, int]]] = None,
+) -> Tuple[List[ScheduleEntry], Set[Tuple[int, int]], Set[Tuple[int, int]]]:
+    """Split a schedule at *current_time* into fixed / completed / in-progress.
+
+    Returns
+    -------
+    fixed_entries : list of ScheduleEntry
+        Entries that are either completed (end ≤ now) or in-progress
+        (start < now < end).  These block their assigned machines.
+    completed_keys : set of (job_id, op_idx)
+        Operations that have finished by *current_time*.
+    in_progress_keys : set of (job_id, op_idx)
+        Operations currently being processed (started but not finished).
+    """
+    if previously_fixed_keys is None:
+        previously_fixed_keys = set()
+
+    fixed_entries: List[ScheduleEntry] = []
+    completed_keys: Set[Tuple[int, int]] = set()
+    in_progress_keys: Set[Tuple[int, int]] = set()
+
+    for e in schedule:
+        key = (e.job_id, e.op_idx)
+        if key in previously_fixed_keys:
+            fixed_entries.append(ScheduleEntry(
+                job_id=e.job_id, op_idx=e.op_idx, machine=e.machine,
+                start_time=e.start_time, end_time=e.end_time, fixed=True))
+            completed_keys.add(key)
+            continue
+
+        if e.end_time <= current_time:
+            fixed_entries.append(ScheduleEntry(
+                job_id=e.job_id, op_idx=e.op_idx, machine=e.machine,
+                start_time=e.start_time, end_time=e.end_time, fixed=True))
+            completed_keys.add(key)
+        elif e.start_time < current_time < e.end_time:
+            fixed_entries.append(ScheduleEntry(
+                job_id=e.job_id, op_idx=e.op_idx, machine=e.machine,
+                start_time=e.start_time, end_time=e.end_time, fixed=True))
+            in_progress_keys.add(key)
+
+    return fixed_entries, completed_keys, in_progress_keys
+
+
+def _get_ready_successors(
+    completed_keys: Set[Tuple[int, int]],
+    in_progress_keys: Set[Tuple[int, int]],
+    job_map: Dict[int, Job],
+    fixed_keys: Set[Tuple[int, int]],
+    new_job_ids: Optional[Set[int]] = None,
+) -> List[Tuple[int, int]]:
+    """Return operations that are ready for dispatch at a decision point.
+
+    Ready means: the operation's predecessor is completed AND the operation
+    itself is not already fixed, completed, or in-progress.
+
+    For newly arrived jobs, ALL operations are returned (the scheduler will
+    only pick the first one since successors aren't ready yet).
+    """
+    if new_job_ids is None:
+        new_job_ids = set()
+
+    ready: List[Tuple[int, int]] = []
+
+    for job in job_map.values():
+        jid = job.job_id
+
+        # New jobs: only the first operation is ready; successors become
+        # ready when their predecessor completes (handled by event loop).
+        if jid in new_job_ids:
+            first_key = (jid, 0)
+            if first_key not in fixed_keys:
+                ready.append(first_key)
+            continue
+
+        # Existing jobs: find the first operation that isn't completed,
+        # in-progress, or fixed — its predecessor must be completed.
+        for idx, op in enumerate(job.operations):
+            key = (jid, op.op_idx)
+            if key in fixed_keys or key in in_progress_keys:
+                continue
+            if key in completed_keys:
+                continue
+            if idx == 0:
+                ready.append(key)
+                break
+            else:
+                prev_key = (jid, idx - 1)
+                if prev_key in completed_keys:
+                    ready.append(key)
+                    break
+                else:
+                    # Predecessor not completed → this and later ops blocked
+                    break
+
+    return ready
+
+
+# ═════════════════════════════════════════════════════════════════════════
 #  Event-driven simulation engine
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -165,24 +270,14 @@ def _build_machine_queues(ready_ops: Set[Tuple[int, int]],
     return queues
 
 
-def _filter_scenario(jobs: List[Job],
-                     disruptions: List[dict],
-                     snapshot_time: float) -> tuple:
-    """Return (jobs, disruptions) for what is known at *snapshot_time*.
-
-    Only jobs that have already arrived and disruptions whose time has
-    already passed are included — this prevents the scheduler from
-    "seeing the future" and ensures each snapshot reflects true online
-    decision-making.
-    """
-    known_jobs = [j for j in jobs if j.arrival_time <= snapshot_time]
-    known_disruptions = [d for d in disruptions if d["time"] <= snapshot_time]
-    return known_jobs, known_disruptions
-
-
 def simulate_rule(rule_name: str,
                   jobs: List[Job],
-                  disruptions: List[dict]) -> dict:
+                  disruptions: List[dict],
+                  current_time: float = 0.0,
+                  previous_schedule: Optional[List[ScheduleEntry]] = None,
+                  previous_partial_entries: Optional[List[ScheduleEntry]] = None,
+                  fixed_keys_in: Optional[Set[Tuple[int, int]]] = None,
+                  ) -> dict:
     """Run an event-driven simulation of the FJSP under a single dispatching rule.
 
     Parameters
@@ -193,6 +288,17 @@ def simulate_rule(rule_name: str,
         All jobs (initial + dynamic), each with its arrival time.
     disruptions : list of dict
         Each dict has keys ``'time'`` (float) and ``'machine'`` (str).
+    current_time : float
+        The moment at which the simulation starts (0.0 = from scratch).
+    previous_schedule : list of ScheduleEntry or None
+        A prior plan to warm-start from.  Ops completed or in-progress at
+        *current_time* are fixed; unstarted ops are thrown back into the
+        ready pool for rescheduling.
+    previous_partial_entries : list of ScheduleEntry or None
+        Partial (interrupted) entries from a prior stage.
+    fixed_keys_in : set of (job_id, op_idx) or None
+        Keys already fixed in even-earlier stages (passed through to
+        :func:`_split_schedule_at_time`).
 
     Returns
     -------
@@ -227,7 +333,7 @@ def simulate_rule(rule_name: str,
     op_start_times: Dict[Tuple[int, int], Tuple[float, str]] = {}
 
     # machine_free_at: when each machine finishes its current operation
-    machine_free_at: Dict[str, float] = {m: 0.0 for m in ALL_MACHINES}
+    machine_free_at: Dict[str, float] = {m: current_time for m in ALL_MACHINES}
 
     # machine_broken_at: the time when a machine breaks (inf = never)
     machine_broken_at: Dict[str, float] = {m: float('inf') for m in ALL_MACHINES}
@@ -236,7 +342,12 @@ def simulate_rule(rule_name: str,
     schedule: List[ScheduleEntry] = []
 
     # partial entries: operations that were interrupted by a machine break
-    partial_entries: List[ScheduleEntry] = []
+    partial_entries: List[ScheduleEntry] = (
+        list(previous_partial_entries) if previous_partial_entries else []
+    )
+
+    # Track fixed keys across stages
+    fixed_keys: Set[Tuple[int, int]] = set(fixed_keys_in) if fixed_keys_in else set()
 
     # ── Event queue ─────────────────────────────────────────────────────
     # Each event is a 4-tuple: (time, tiebreak, event_type, data)
@@ -249,20 +360,64 @@ def simulate_rule(rule_name: str,
         heapq.heappush(events, (t, _event_counter, etype, data))
         _event_counter += 1
 
-    # Schedule job arrivals
+    # ── Warm-start from previous schedule ───────────────────────────────
+    if previous_schedule is not None:
+        fixed_now, completed_now, in_progress_now = _split_schedule_at_time(
+            previous_schedule, current_time, fixed_keys)
+
+        # Identify new jobs arriving at current_time
+        new_job_ids: Set[int] = {
+            j.job_id for j in jobs
+            if j.arrival_time == current_time and j.arrival_time > 0
+        }
+
+        # Apply fixed entries to machine state
+        for e in fixed_now:
+            key = (e.job_id, e.op_idx)
+            fixed_keys.add(key)
+            if key in in_progress_now:
+                # In-progress → machine busy until it completes.
+                # Do NOT add to schedule yet — the completion event will do that.
+                machine_free_at[e.machine] = max(machine_free_at[e.machine], e.end_time)
+                op_in_progress[key] = e.machine
+                op_start_times[key] = (e.start_time, e.machine)
+                push_event(e.end_time, _EVT_OP_COMPLETE, (e.job_id, e.op_idx, e.machine))
+            else:
+                # Already completed → add to schedule directly
+                schedule.append(e)
+            # Update job_next_ready
+            if e.op_idx >= job_next_ready.get(e.job_id, 0):
+                job_next_ready[e.job_id] = e.op_idx + 1
+
+        # Determine ready ops at current_time
+        ready_ops_list = _get_ready_successors(
+            completed_now, in_progress_now, job_map, fixed_keys, new_job_ids)
+        ready_ops = set(ready_ops_list)
+
+        # Mark jobs that have arrived by current_time
+        for job in jobs:
+            if job.arrival_time <= current_time:
+                job_arrived[job.job_id] = True
+    else:
+        # ── Cold start (original behaviour) ─────────────────────────────
+        # Mark jobs that arrive at t=0 as arrived, and their first ops as ready
+        for job in jobs:
+            if job.arrival_time <= 0.0:
+                job_arrived[job.job_id] = True
+                ready_ops.add((job.job_id, 0))
+
+    # Schedule remaining job arrivals (those after current_time)
     for job in jobs:
-        if job.arrival_time > 0:
+        if job.arrival_time > current_time:
             push_event(job.arrival_time, _EVT_JOB_ARRIVAL, job.job_id)
 
-    # Schedule machine breakdowns
+    # Schedule machine breakdowns (those after current_time)
     for d in disruptions:
-        push_event(d["time"], _EVT_MACHINE_BREAK, d["machine"])
-
-    # Mark jobs that arrive at t=0 as arrived, and their first ops as ready
-    for job in jobs:
-        if job.arrival_time <= 0.0:
-            job_arrived[job.job_id] = True
-            ready_ops.add((job.job_id, 0))
+        if d["time"] >= current_time:
+            push_event(d["time"], _EVT_MACHINE_BREAK, d["machine"])
+        else:
+            # Past disruption — mark machine as already broken
+            machine_broken_at[d["machine"]] = d["time"]
 
     # ── Dispatch function ───────────────────────────────────────────────
     def dispatch_machine(m: str, now: float) -> Optional[Tuple[int, int]]:
@@ -357,7 +512,7 @@ def simulate_rule(rule_name: str,
 
     # ── Initial dispatch ────────────────────────────────────────────────
     for m in ALL_MACHINES:
-        dispatch_machine(m, 0.0)
+        dispatch_machine(m, current_time)
 
     # ── Main event loop ─────────────────────────────────────────────────
     while events:
@@ -572,116 +727,175 @@ def build_snapshot(final_entries: List[ScheduleEntry],
 # ═════════════════════════════════════════════════════════════════════════
 
 def run_experiments() -> Optional[dict]:
-    """Run SPT, FIFO and WINQ simulations on the Kacem 8x8 benchmark.
+    """Run SPT, FIFO and WINQ rolling-horizon rescheduling on the Kacem 8x8 benchmark.
 
-    For each rule, **three independent simulations** are executed — one
-    at each decision point — using only the information available at
-    that time (no "clairvoyance"):
+    The simulation follows three decision stages, all starting from Baseline A
+    (the optimal MILP solution for J1-J8):
 
-    * t=0 : J1-J8 only, no disruption knowledge
-    * t=2 : J1-J10,    no disruption knowledge
-    * t=6 : J1-J10 + M3 breakdown
+    * **t=0** : Initial plan = Baseline A schedule (J1-J8, C_max=14).
+      No ops are fixed yet — this is the intended plan before any disruption.
+    * **t=2** : J9 and J10 arrive.  Ops completed or in-progress by t=2 from
+      the Baseline A plan are **fixed**; remaining ops (including J9/J10)
+      are rescheduled with the chosen dispatching rule.
+    * **t=6** : M3 breaks down.  Ops completed or in-progress by t=6 from the
+      t=2 re-plan are **fixed**; ops running on M3 are **interrupted** and
+      go back to the ready pool.  All unfixed ops are rescheduled with the
+      chosen dispatching rule (M3 is permanently dead).
 
     Returns a dict with keys ``"rules"`` (rule_name → snapshot_time →
     cmax + schedule + partial_entries) and ``"metadata"``, or ``None``
-    on data-load failure.
+    on data-load or baseline-cache failure.
 
     Results are cached to *output/pure_rule_results.json*.
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # ── Load Baseline A (optimal t=0 schedule for J1-J8) ──────────────────
+    baseline_cache = os.path.join(OUTPUT_DIR, "baseline_results.json")
+    if not os.path.exists(baseline_cache):
+        print("ERROR: baseline_results.json not found. Run run_baselines.py first.",
+              file=sys.stderr)
+        return None
+    with open(baseline_cache, "r", encoding="utf-8") as f:
+        bl = json.load(f)
+    baseline_a_entries = [ScheduleEntry(**e) for e in bl["baselines"]["A"]["entries"]]
+    baseline_a_cmax = bl["baselines"]["A"]["cmax"]
+    baseline_a_time = bl["baselines"]["A"].get("compute_time", 0.0)
+
+    # ── Load problem data ────────────────────────────────────────────────
     initial_jobs, dynamic_jobs, disruptions = load_data()
     all_jobs = initial_jobs + dynamic_jobs
 
     print("=" * 72)
-    print("  Kacem 8x8 FJSP -- Single-Level Rule-Based Scheduling")
+    print("  Kacem 8x8 FJSP -- Single-Level Rule-Based Rescheduling")
     print("=" * 72)
-    print(f"  Initial jobs : {len(initial_jobs)}  (J1-J{len(initial_jobs)})")
-    print(f"  Dynamic jobs : {len(dynamic_jobs)}  (arrive at t="
+    print(f"  Initial plan  : Baseline A  (J1-J{len(initial_jobs)}, C_max={baseline_a_cmax})")
+    print(f"  Initial jobs  : {len(initial_jobs)}  (J1-J{len(initial_jobs)})")
+    print(f"  Dynamic jobs  : {len(dynamic_jobs)}  (arrive at t="
           f"{dynamic_jobs[0].arrival_time if dynamic_jobs else 'N/A'})")
-    print(f"  Disruptions  : {len(disruptions)}")
+    print(f"  Disruptions   : {len(disruptions)}")
     for d in disruptions:
-        print(f"                 {d['machine']} breakdown at t={d['time']}")
+        print(f"                  {d['machine']} breakdown at t={d['time']}")
     total_ops = sum(len(j.operations) for j in all_jobs)
-    print(f"  Total ops    : {total_ops}")
-    print(f"  Machines     : {len(ALL_MACHINES)}  ({', '.join(ALL_MACHINES)})")
+    print(f"  Total ops     : {total_ops}")
+    print(f"  Machines      : {len(ALL_MACHINES)}  ({', '.join(ALL_MACHINES)})")
+    print(f"  Rescheduling  : t=2 (J9/J10 arrive)  →  t=6 (M3 breakdown)")
     print("-" * 72)
 
     rules = ["SPT", "FIFO", "WINQ"]
     results: Dict[str, dict] = {}
+    # Per-rule compute times (cumulative)
+    rule_total_times: Dict[str, float] = {}
 
     for rule_name in rules:
         print(f"\n[{rule_name}]")
         rule_results: Dict[str, dict] = {}
+        t_start_rule = time.perf_counter()
 
-        for t in SNAPSHOT_TIMES:
-            # ── Filter to what is known at time t ──────────────────────────
-            known_jobs, known_disruptions = _filter_scenario(
-                all_jobs, disruptions, t)
+        # ── Stage 0: t=0 — Baseline A initial plan ────────────────────────
+        print(f"  Stage 0 — t=0  Using Baseline A  (J1-J{len(initial_jobs)}, "
+              f"C_max={baseline_a_cmax:.3f})")
+        rule_results["0.0"] = {
+            "cmax": baseline_a_cmax,
+            "entries": [asdict(e) for e in baseline_a_entries],
+            "partial_entries": [],
+            "compute_time": baseline_a_time,
+        }
 
-            sim_result = simulate_rule(rule_name, known_jobs, known_disruptions)
+        # ── Stage 1: t=2 — J9/J10 arrive, reschedule from Baseline A ──────
+        t_event = 2.0
+        print(f"  Stage 1 — t={t_event:.0f}  J9, J10 arrive  →  rule-based rescheduling ...")
 
-            cmax = sim_result["cmax"]
-            dt = sim_result["compute_time"]
-            n_entries = len(sim_result["entries"])
-            n_partial = len(sim_result["partial_entries"])
+        sim_2 = simulate_rule(
+            rule_name, all_jobs, [],
+            current_time=t_event,
+            previous_schedule=baseline_a_entries,
+        )
 
-            partial_str = f"  partial (interrupted) = {n_partial}" if n_partial else ""
-            n_jobs = len(known_jobs)
-            print(f"  t={t:.0f}  |  {n_jobs:2d} jobs  |  "
-                  f"C_max = {cmax:7.3f}  |  "
-                  f"compute = {dt*1000:5.1f} ms  |  "
-                  f"ops scheduled = {n_entries}"
-                  f"{'  |  ' + partial_str if partial_str else ''}")
+        cmax_2 = sim_2["cmax"]
+        dt_2 = sim_2["compute_time"]
+        n_entries_2 = len(sim_2["entries"])
+        n_jobs_2 = len([j for j in all_jobs if j.arrival_time <= t_event])
+        print(f"           |  {n_jobs_2:2d} jobs  |  "
+              f"C_max = {cmax_2:7.3f}  |  "
+              f"compute = {dt_2*1000:5.1f} ms  |  "
+              f"ops scheduled = {n_entries_2}")
+        rule_results["2.0"] = sim_2
 
-            rule_results[str(t)] = sim_result
+        sched_2_entries = [ScheduleEntry(**e) for e in sim_2["entries"]]
+        partial_2 = [ScheduleEntry(**e) for e in sim_2.get("partial_entries", [])]
+
+        # ── Stage 2: t=6 — M3 breakdown, reschedule from t=2 plan ─────────
+        t_event = 6.0
+        broken_machine = disruptions[0]["machine"] if disruptions else "M3"
+        print(f"  Stage 2 — t={t_event:.0f}  {broken_machine} breakdown  →  rule-based rescheduling ...")
+
+        sim_6 = simulate_rule(
+            rule_name, all_jobs, disruptions,
+            current_time=t_event,
+            previous_schedule=sched_2_entries,
+            previous_partial_entries=partial_2,
+        )
+
+        cmax_6 = sim_6["cmax"]
+        dt_6 = sim_6["compute_time"]
+        n_entries_6 = len(sim_6["entries"])
+        n_partial_6 = len(sim_6["partial_entries"])
+        n_jobs_6 = len([j for j in all_jobs if j.arrival_time <= t_event])
+        partial_str = f"  partial (interrupted) = {n_partial_6}" if n_partial_6 else ""
+        print(f"           |  {n_jobs_6:2d} jobs  |  "
+              f"C_max = {cmax_6:7.3f}  |  "
+              f"compute = {dt_6*1000:5.1f} ms  |  "
+              f"ops scheduled = {n_entries_6}"
+              f"{'  |  ' + partial_str if partial_str else ''}")
+        rule_results["6.0"] = sim_6
 
         results[rule_name] = rule_results
+        rule_total_times[rule_name] = time.perf_counter() - t_start_rule
 
     # ── Summary ─────────────────────────────────────────────────────────
     print("\n" + "-" * 72)
-    print("  Summary  (single-level rule-based, per-decision-point simulation)")
+    print("  Summary  (single-level rule-based, rolling-horizon from Baseline A)")
     print("-" * 72)
     header = f"  {'Rule':6s}"
     for t in SNAPSHOT_TIMES:
         header += f"    {'t=' + str(int(t)):>8s}"
-    header += f"    {'Jobs':>5s}"
+    header += f"    {'Total':>8s}"
     print(header)
-    print("  " + "-" * (6 + len(SNAPSHOT_TIMES) * 13 + 6))
+    print("  " + "-" * (6 + len(SNAPSHOT_TIMES) * 13 + 9))
     for rule_name in rules:
         line = f"  {rule_name:6s}"
         for t in SNAPSHOT_TIMES:
             line += f"    {results[rule_name][str(t)]['cmax']:8.3f}"
-        t_key = str(SNAPSHOT_TIMES[-1])
-        n_partial = len(results[rule_name][t_key].get("partial_entries", []))
-        partial_note = f"  [{n_partial} interrupted]" if n_partial else ""
-        line += f"    {results[rule_name][t_key]['compute_time']*1000:5.0f}ms"
-        if partial_note:
-            line += f"  {partial_note}"
+        line += f"    {rule_total_times[rule_name]*1000:5.0f}ms"
+        t6 = results[rule_name]["6.0"]
+        n_partial = len(t6.get("partial_entries", []))
+        if n_partial:
+            line += f"  [{n_partial} interrupted]"
         print(line)
     print("-" * 72)
 
-    # Load Gurobi baselines for comparison (if available)
-    baseline_cache = os.path.join(OUTPUT_DIR, "baseline_results.json")
-    if os.path.exists(baseline_cache):
-        with open(baseline_cache, "r", encoding="utf-8") as f:
-            bl = json.load(f)
-        print("\n  Comparison with Gurobi MILP baselines (all solved at t=0):")
-        print(f"  Baseline A  (J1-J8 only, optimal)        C_max = {bl['baselines']['A']['cmax']:7.3f}")
-        print(f"  Baseline B  (J1-J10 clairvoyant)         C_max = {bl['baselines']['B']['cmax']:7.3f}")
-        print(f"  Baseline C  (J1-J10 + M3 dead at t=6)    C_max = {bl['baselines']['C']['cmax']:7.3f}")
+    # ── Comparison with Gurobi baselines ──────────────────────────────────
+    print("\n  Comparison with Gurobi MILP baselines (clairvoyant / optimal):")
+    print(f"  Baseline A  (J1-J8 only, optimal)        C_max = {bl['baselines']['A']['cmax']:7.3f}")
+    print(f"  Baseline B  (J1-J10 clairvoyant)         C_max = {bl['baselines']['B']['cmax']:7.3f}")
+    print(f"  Baseline C  (J1-J10 + M3 dead at t=6)    C_max = {bl['baselines']['C']['cmax']:7.3f}")
 
     # ── Assemble output ─────────────────────────────────────────────────
     job_arrival_times = {j.job_id: j.arrival_time for j in all_jobs}
     output = {
         "rules": results,
         "metadata": {
-            "description": "Single-level rule-based FJSP scheduling (SPT / FIFO / WINQ)",
+            "description": (
+                "Single-level rule-based FJSP rolling-horizon rescheduling "
+                "(SPT / FIFO / WINQ) from Baseline A initial plan"
+            ),
             "disruptions": disruptions,
             "num_jobs": len(all_jobs),
             "num_machines": len(ALL_MACHINES),
             "job_arrival_times": job_arrival_times,
             "snapshot_times": SNAPSHOT_TIMES,
+            "baseline_a_cmax": baseline_a_cmax,
         },
     }
 
@@ -703,8 +917,13 @@ def _plot_one_rule(rule_name: str,
                    job_arrival_times: Optional[Dict[int, float]] = None) -> None:
     """Generate a single figure with 3 snapshot Gantt panels for one rule.
 
-    Each panel is drawn from an **independent** simulation that only knew
-    the jobs and disruptions whose time ``<=`` the snapshot time.
+    Each panel shows the full schedule **as planned** at that decision point:
+
+    * t=0 — Baseline A initial plan (J1-J8, all unfixed)
+    * t=2 — Re-plan after J9/J10 arrival (fixed ops from Baseline A at t=2,
+      rule-based rescheduling for the rest)
+    * t=6 — Re-plan after M3 breakdown (fixed ops from t=2 plan at t=6,
+      rule-based rescheduling for the rest)
 
     Parameters
     ----------

@@ -220,7 +220,7 @@
           "fixed": false
         }
       ],
-      "compute_time": 7.06379939999897,
+      "compute_time": 6.49088969999957,
       "evaluations": 81286,
       "generations": 100
     },
@@ -484,7 +484,7 @@
           "fixed": false
         }
       ],
-      "compute_time": 7.2808941999974195,
+      "compute_time": 6.438609100000576,
       "evaluations": 81286,
       "generations": 100
     },
@@ -748,7 +748,7 @@
           "fixed": false
         }
       ],
-      "compute_time": 6.543524499997147,
+      "compute_time": 6.3315073000003395,
       "evaluations": 81286,
       "generations": 100
     }

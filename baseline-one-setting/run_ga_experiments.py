@@ -286,7 +286,13 @@ def simulate_bi_level_ga(
 
     # ── Stage 0: t=0 — Global optimal schedule ─────────────────────────────
     t_stage_0_start = time.perf_counter()
+    bl_a_compute_time = None  # loaded from cache if available
     if initial_schedule is not None:
+        # Load Baseline A's actual Gurobi computation time from cache
+        if os.path.exists(BASELINE_CACHE):
+            with open(BASELINE_CACHE, "r", encoding="utf-8") as _f:
+                _bl = json.load(_f)
+            bl_a_compute_time = _bl["baselines"]["A"].get("compute_time")
         print(f"\n  [{rule_name}] Stage 0 — t=0  Using cached Baseline A")
         sched_0 = list(initial_schedule)
     else:
@@ -307,7 +313,7 @@ def simulate_bi_level_ga(
             return None
 
     cmax_0 = max(e.end_time for e in sched_0)
-    dt_stage_0 = time.perf_counter() - t_stage_0_start
+    dt_stage_0 = bl_a_compute_time if bl_a_compute_time is not None else (time.perf_counter() - t_stage_0_start)
     print(f"    OK  C_max = {cmax_0:.3f}")
     snapshot_schedules['0.0'] = [e for e in sched_0]
 
@@ -328,7 +334,10 @@ def simulate_bi_level_ga(
     # Ready ops
     ready_2: List[Tuple[int, int]] = []
     for j in new_jobs:
-        ready_2.append((j.job_id, 0))
+        for op in j.operations:
+            key = (j.job_id, op.op_idx)
+            if key not in fixed_keys:
+                ready_2.append(key)
     for (jid, oidx) in completed_2:
         job = job_map[jid]
         next_oidx = oidx + 1
@@ -570,7 +579,7 @@ def _run_unit_ga_stage(
             unit_deadlines = {m: dl for m, dl in machine_deadlines.items()
                              if m in unit_machines}
 
-        n_fixed = len([e for e in fixed_entries if e.machine in unit_machines])
+        n_fixed = len([e for e in sched_all if e.machine in unit_machines])
         n_unit_ops = len([k for k in unit_op_keys if k not in fixed_keys])
         deadline_str = f"  [{', '.join(f'{m}→{dl:.0f}' for m, dl in (unit_deadlines or {}).items())}]" if unit_deadlines else ""
         print(f"    {label_prefix} [{unit_name}]  "
@@ -586,8 +595,10 @@ def _run_unit_ga_stage(
             n_restarts=ga_kwargs.get('n_restarts', 1),
             seed=42 + int(current_time) + (1 if unit_name == 'U1' else 2),
         )
+        # Pass the accumulating schedule so this unit sees decisions made
+        # by units solved earlier in this stage.
         unit_schedule = solver.solve(
-            unit_jobs, list(fixed_entries), current_time=current_time,
+            unit_jobs, list(sched_all), current_time=current_time,
             machine_deadlines=unit_deadlines,
         )
 
@@ -595,13 +606,15 @@ def _run_unit_ga_stage(
             print(f"    {label_prefix} !! [{unit_name}] GA failed")
             return None, all_partial
 
+        # Only collect entries for operations assigned to this unit.
         for e in unit_schedule:
-            if (e.job_id, e.op_idx) not in fixed_keys:
+            key = (e.job_id, e.op_idx)
+            if key not in fixed_keys and key in unit_op_keys:
                 sched_all.append(e)
 
         cmax_u = max((e.end_time for e in unit_schedule), default=0.0)
         n_new = len([e for e in unit_schedule
-                     if (e.job_id, e.op_idx) not in fixed_keys])
+                     if (e.job_id, e.op_idx) not in fixed_keys and (e.job_id, e.op_idx) in unit_op_keys])
         print(f"    {label_prefix} [{unit_name}]  C_max = {cmax_u:.3f}  "
               f"({n_new} new entries)")
 
@@ -664,8 +677,10 @@ def run_bi_level_ga() -> Optional[dict]:
             bl_cache = json.load(f)
         baseline_a_entries = bl_cache["baselines"]["A"]["entries"]
         initial_schedule = [ScheduleEntry(**e) for e in baseline_a_entries]
+        bl_a_ct = bl_cache["baselines"]["A"].get("compute_time", 0.0)
         print(f"\n  Using cached Baseline A for t=0  "
-              f"(C_max = {bl_cache['baselines']['A']['cmax']:.3f})")
+              f"(C_max = {bl_cache['baselines']['A']['cmax']:.3f},  "
+              f"compute_time = {bl_a_ct:.1f}s)")
     else:
         print("\n  No cached baseline — will use global GA at t=0")
 

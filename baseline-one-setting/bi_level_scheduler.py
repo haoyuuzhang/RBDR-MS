@@ -352,6 +352,7 @@ def simulate_bi_level(
     disruptions: List[dict],
     unit_solver: UnitSolver,
     initial_schedule: Optional[List[ScheduleEntry]] = None,
+    t0_compute_time: float = 0.0,
 ) -> Optional[dict]:
     """Run bi-level scheduling simulation across three decision points.
 
@@ -403,7 +404,9 @@ def simulate_bi_level(
         print(f"\n  [{rule_name}] Stage 0 — t=0  Using cached optimal schedule  "
               f"(J1-J{len(initial_jobs)}, all 8 machines)")
         sched_0 = list(initial_schedule)
-        dt0 = 0.0
+        # t=0 computation time comes from the caller (e.g. Baseline A solve time)
+        # or from the t0_compute_time parameter
+        dt0 = t0_compute_time
     else:
         print(f"\n  [{rule_name}] Stage 0 — t=0  Global MILP  (J1-J{len(initial_jobs)}, "
               f"all 8 machines) ...")
@@ -451,9 +454,12 @@ def simulate_bi_level(
     # - Successors of completed ops
     ready_2: List[Tuple[int, int]] = []
 
-    # New jobs: first operations are ready
+    # New jobs: all unfixed operations need unit assignment
     for j in new_jobs:
-        ready_2.append((j.job_id, 0))
+        for op in j.operations:
+            key = (j.job_id, op.op_idx)
+            if key not in fixed_keys:
+                ready_2.append(key)
 
     # Existing jobs: successors of completed ops
     for (jid, oidx) in completed_2:
@@ -515,7 +521,7 @@ def simulate_bi_level(
         # Build unit-specific jobs — keep ALL operations at original positions
         # so that op_idx matches the list index (required by schedule_makespan_milp).
         # Ops not assigned to this unit get times restricted to the OTHER unit's
-        # machines so they are not schedulable here.
+        # machines so they are only used for precedence, not for actual scheduling.
         unit_jobs: List[Job] = []
         all_jids_in_play = {k[0] for k in unit_op_keys} | {e.job_id for e in fixed_2}
         for jid in all_jids_in_play:
@@ -533,24 +539,26 @@ def simulate_bi_level(
                                         if m in unit_machines}
                 else:
                     # Not assigned to this unit, not fixed →
-                    # restrict to OTHER unit's machines (won't be schedulable here)
+                    # restrict to OTHER unit's machines so the MILP can
+                    # reason about precedence without actually scheduling them
+                    # on this unit's machines.
                     restricted_times = {m: t for m, t in orig_op.times.items()
                                         if m in other_machines}
                 new_ops.append(Operation(jid, orig_op.op_idx, restricted_times))
             unit_jobs.append(Job(jid, original_job.arrival_time, new_ops))
 
-        # Pass ALL fixed entries (both units) so the MILP knows about every
-        # committed operation.  Entries on the other unit's machines block
-        # those machines, which is correct — this unit cannot use them.
-        unit_fixed_all = list(fixed_2)
+        # Pass ALL currently committed entries as fixed so that each unit
+        # sees decisions made by units solved earlier in this stage.  This
+        # ensures correct precedence across units within the same stage.
+        unit_fixed_all = list(sched_2_all)
 
         if not unit_jobs and not unit_fixed_all:
             print(f"    [{unit_name}]  No work — skipping")
             continue
 
-        n_unit_fixed = len([e for e in fixed_2 if e.machine in unit_machines])
+        n_unit_fixed = len([e for e in sched_2_all if e.machine in unit_machines])
         print(f"    [{unit_name}]  {len(unit_jobs)} jobs, {n_unit_fixed} fixed "
-              f"(+ {len(fixed_2) - n_unit_fixed} other-unit)  → MILP ...")
+              f"(+ {len(sched_2_all) - n_unit_fixed} other-unit)  → MILP ...")
         t_milp = time.perf_counter()
         unit_schedule = unit_solver.solve(
             unit_jobs, unit_fixed_all, current_time=t_event, time_limit=120.0)
@@ -561,9 +569,13 @@ def simulate_bi_level(
             print(f"    !! [{unit_name}] MILP failed")
             return None
 
-        # Add non-fixed entries to the consolidated schedule
+        # Only collect entries for operations assigned to this unit.
+        # Entries for other-unit ops are discarded — they were only
+        # included in the MILP for precedence purposes and will be
+        # supplied by that unit's own MILP.
         for e in unit_schedule:
-            if (e.job_id, e.op_idx) not in fixed_keys:
+            key = (e.job_id, e.op_idx)
+            if key not in fixed_keys and key in unit_op_keys:
                 sched_2_all.append(e)
 
         cmax_u = max((e.end_time for e in unit_schedule), default=0.0)
@@ -701,6 +713,8 @@ def simulate_bi_level(
 
         # Build unit-specific jobs — keep ALL operations at original positions
         # so that op_idx matches the list index (required by schedule_makespan_milp).
+        # Ops not assigned to this unit get times restricted to the OTHER unit's
+        # machines so they are only used for precedence, not for actual scheduling.
         unit_jobs: List[Job] = []
         all_jids_in_play_6 = {k[0] for k in unit_op_keys} | {e.job_id for e in fixed_6}
         for jid in all_jids_in_play_6:
@@ -720,9 +734,9 @@ def simulate_bi_level(
                 new_ops.append(Operation(jid, orig_op.op_idx, restricted_times))
             unit_jobs.append(Job(jid, original_job.arrival_time, new_ops))
 
-        # Pass ALL fixed entries (both units) so the MILP knows about every
-        # committed operation.
-        unit_fixed_all = list(fixed_6)
+        # Pass ALL currently committed entries as fixed so that each unit
+        # sees decisions made by units solved earlier in this stage.
+        unit_fixed_all = list(sched_6_all)
 
         # Check if there are any ops in this unit that actually need scheduling
         has_unit_work = any(
@@ -738,9 +752,9 @@ def simulate_bi_level(
         # Only apply machine_deadlines to the unit containing the broken machine
         unit_deadlines = machine_deadlines if broken_machine in unit_machines else None
 
-        n_unit_fixed = len([e for e in fixed_6 if e.machine in unit_machines])
+        n_unit_fixed = len([e for e in sched_6_all if e.machine in unit_machines])
         print(f"    [{unit_name}]  {len(unit_jobs)} jobs, {n_unit_fixed} fixed"
-              f"  (+ {len(fixed_6) - n_unit_fixed} other-unit)"
+              f"  (+ {len(sched_6_all) - n_unit_fixed} other-unit)"
               f"{'  [M3 deadline]' if unit_deadlines else ''}  → MILP ...")
         t_milp = time.perf_counter()
         unit_schedule = unit_solver.solve(
@@ -753,8 +767,10 @@ def simulate_bi_level(
             print(f"    !! [{unit_name}] MILP failed")
             return None
 
+        # Only collect entries for operations assigned to this unit.
         for e in unit_schedule:
-            if (e.job_id, e.op_idx) not in fixed_keys:
+            key = (e.job_id, e.op_idx)
+            if key not in fixed_keys and key in unit_op_keys:
                 sched_6_all.append(e)
 
         cmax_u = max((e.end_time for e in unit_schedule), default=0.0)

@@ -202,13 +202,16 @@ def run_experiments() -> Optional[dict]:
 
     # ── Load cached Baseline A schedule for t=0 ──────────────────────────
     initial_schedule: Optional[List[ScheduleEntry]] = None
+    t0_compute_time: float = 0.0
     if os.path.exists(BASELINE_CACHE):
         with open(BASELINE_CACHE, "r", encoding="utf-8") as f:
             bl_cache = json.load(f)
         baseline_a_entries = bl_cache["baselines"]["A"]["entries"]
         initial_schedule = [ScheduleEntry(**e) for e in baseline_a_entries]
+        t0_compute_time = bl_cache["baselines"]["A"].get("compute_time", 0.0)
         print(f"\n  Using cached Baseline A for t=0  "
-              f"(C_max = {bl_cache['baselines']['A']['cmax']:.3f})")
+              f"(C_max = {bl_cache['baselines']['A']['cmax']:.3f},  "
+              f"compute_time = {t0_compute_time:.1f}s)")
     else:
         print("\n  No cached baseline — will attempt Gurobi global solve at t=0")
 
@@ -230,7 +233,8 @@ def run_experiments() -> Optional[dict]:
         print(f"{'─' * 72}")
 
         sim_result = simulate_bi_level(rule_name, all_jobs, disruptions, solver,
-                                        initial_schedule=initial_schedule)
+                                        initial_schedule=initial_schedule,
+                                        t0_compute_time=t0_compute_time)
 
         if sim_result is None:
             print(f"  !! {rule_name}-MILP failed")
