@@ -19,5 +19,5 @@ WINQ         +13.79%         5         2   +13.79%   +15.15%         1         1
 Notes:
   Optimal Stage-1 degradation:  0.00%  (Baseline: cmax 14h -> 14h with J9/J10)
   Optimal Stage-2 degradation: +7.14%  (Baseline: cmax 14h -> 15h with M3 breakdown)
-  Stage 1 (J9+J10):  most resilient = FIFO (-16.22%),  most fragile = WINQ (+13.79%)
-  Stage 2 (M3 breakdown):  most resilient = SPT (-7.14%),  most fragile = FIFO (+18.66%)
+  Stage 1 (J9+J10) (single-level):  most resilient = FIFO (-16.22%),  most fragile = WINQ (+13.79%)
+  Stage 2 (M3 breakdown) (single-level):  most resilient = SPT (-7.14%),  most fragile = FIFO (+18.66%)

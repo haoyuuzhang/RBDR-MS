@@ -17,6 +17,7 @@ if _HERE not in sys.path:
 OUTPUT_DIR = os.path.join(_HERE, "output")
 BASELINE_CACHE = os.path.join(OUTPUT_DIR, "baseline_results.json")
 RULE_CACHE = os.path.join(OUTPUT_DIR, "pure_rule_results.json")
+BI_LEVEL_CACHE = os.path.join(OUTPUT_DIR, "bi_level_results.json")
 
 
 def fmt_pct(v: float) -> str:
@@ -79,6 +80,42 @@ def main():
             "interrupted_jobs": interrupted_jobs,
         }
 
+    # -- Bi-level metrics ---------------------------------------------------
+    bi_level_data = {}
+    if os.path.exists(BI_LEVEL_CACHE):
+        with open(BI_LEVEL_CACHE, "r", encoding="utf-8") as f:
+            bl_raw2 = json.load(f)
+        for rule_name in ["SPT", "FIFO", "WINQ"]:
+            if rule_name not in bl_raw2.get("rules", {}):
+                continue
+            r = bl_raw2["rules"][rule_name]
+            cmax_t0 = r["snapshot_cmax"]["0.0"]
+            cmax_t2 = r["snapshot_cmax"]["2.0"]
+            cmax_t6 = r["snapshot_cmax"]["6.0"]
+
+            deg1 = (cmax_t2 - cmax_t0) / cmax_t0 * 100
+            deg2 = (cmax_t6 - cmax_t2) / cmax_t2 * 100
+            excess_deg1 = deg1 - bl_deg1
+            excess_deg2 = deg2 - bl_deg2
+
+            affected_ops_s1 = 5   # J9: 2 ops, J10: 3 ops
+            affected_jobs_s1 = 2
+
+            partial = r.get("partial_entries", [])
+            interrupted_ops = len(partial)
+            interrupted_jobs = len(set(p["job_id"] for p in partial))
+
+            bi_level_data[rule_name] = {
+                "deg1": deg1,
+                "deg2": deg2,
+                "excess_deg1": excess_deg1,
+                "excess_deg2": excess_deg2,
+                "affected_ops_s1": affected_ops_s1,
+                "affected_jobs_s1": affected_jobs_s1,
+                "interrupted_ops": interrupted_ops,
+                "interrupted_jobs": interrupted_jobs,
+            }
+
     # =====================================================================
     #  Build the table
     # =====================================================================
@@ -130,6 +167,22 @@ def main():
         )
         lines.append(rl)
 
+    # -- Bi-level rows -------------------------------------------------------
+    if bi_level_data:
+        lines.append("")  # blank spacer before bi-level section
+        for rule_name in ["SPT", "FIFO", "WINQ"]:
+            if rule_name not in bi_level_data:
+                continue
+            d = bi_level_data[rule_name]
+            rl = (
+                f"{rule_name + '-MILP':10s}{SEP}"
+                f"{fmt_pct(d['deg1']):>8s}  {d['affected_ops_s1']:>8d}  "
+                f"{d['affected_jobs_s1']:>8d}  {fmt_pct(d['excess_deg1']):>8s}{SEP}"
+                f"{fmt_pct(d['deg2']):>8s}  {d['interrupted_ops']:>8d}  "
+                f"{d['interrupted_jobs']:>8d}  {fmt_pct(d['excess_deg2']):>8s}"
+            )
+            lines.append(rl)
+
     lines.append(HL)
     lines.append("")
 
@@ -144,16 +197,26 @@ def main():
         f"(Baseline: cmax {cmax_B:.0f}h -> {cmax_C:.0f}h with M3 breakdown)"
     )
 
-    # Best/worst per stage
+    # Best/worst per stage (single-level rules only)
     for label, dkey in [("Stage 1 (J9+J10)", "excess_deg1"),
                          ("Stage 2 (M3 breakdown)", "excess_deg2")]:
         vals = [(rules_data[r][dkey], r) for r in ["SPT", "FIFO", "WINQ"]]
         best = min(vals, key=lambda x: x[0])
         worst = max(vals, key=lambda x: x[0])
         lines.append(
-            f"  {label}:  most resilient = {best[1]} ({fmt_pct(best[0])}),  "
+            f"  {label} (single-level):  most resilient = {best[1]} ({fmt_pct(best[0])}),  "
             f"most fragile = {worst[1]} ({fmt_pct(worst[0])})"
         )
+        if bi_level_data:
+            bl_vals = [(bi_level_data[r][dkey], r + '-MILP')
+                       for r in ["SPT", "FIFO", "WINQ"] if r in bi_level_data]
+            if bl_vals:
+                bl_best = min(bl_vals, key=lambda x: x[0])
+                bl_worst = max(bl_vals, key=lambda x: x[0])
+                lines.append(
+                    f"  {label} (bi-level):      most resilient = {bl_best[1]} ({fmt_pct(bl_best[0])}),  "
+                    f"most fragile = {bl_worst[1]} ({fmt_pct(bl_worst[0])})"
+                )
 
     lines.append("")
 

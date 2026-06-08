@@ -27,6 +27,7 @@ import numpy as np
 OUTPUT_DIR = os.path.join(_HERE, "output")
 BASELINE_CACHE = os.path.join(OUTPUT_DIR, "baseline_results.json")
 RULE_CACHE = os.path.join(OUTPUT_DIR, "pure_rule_results.json")
+BI_LEVEL_CACHE = os.path.join(OUTPUT_DIR, "bi_level_results.json")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -48,6 +49,26 @@ def load_rule_data() -> Dict:
                 "compute_time": sim["compute_time"],
             }
     return rules_data
+
+
+def load_bi_level_data() -> Dict:
+    """Load bi-level results.  Returns dict:
+        {rule_name: {snapshot_str: {cmax, compute_time}}}
+    """
+    if not os.path.exists(BI_LEVEL_CACHE):
+        return {}
+    with open(BI_LEVEL_CACHE, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    bi_data: Dict[str, Dict[str, dict]] = {}
+    for rule_name, rule_result in raw["rules"].items():
+        bi_data[rule_name] = {}
+        for t_str in ["0.0", "2.0", "6.0"]:
+            cmax = rule_result["snapshot_cmax"].get(t_str, rule_result["cmax"])
+            bi_data[rule_name][t_str] = {
+                "cmax": cmax,
+                "compute_time": rule_result["compute_time"],
+            }
+    return bi_data
 
 
 def load_baseline_data() -> Dict[str, dict]:
@@ -189,6 +210,7 @@ BASELINE_MARKER = '*'
 
 def plot_scatter(baselines: Dict,
                  rules: Dict,
+                 bi_level: Optional[Dict] = None,
                  log_y: bool = True) -> None:
     """Generate the scatter plot using a two-panel layout.
 
@@ -228,6 +250,11 @@ def plot_scatter(baselines: Dict,
             rule_x_vals.append(vals['cmax'])
     baseline_x_vals = [b['cmax'] for b in baselines.values()]
     all_x_vals = rule_x_vals + baseline_x_vals
+    if bi_level:
+        for rule_name in ['SPT', 'FIFO', 'WINQ']:
+            if rule_name in bi_level:
+                for vals in bi_level[rule_name].values():
+                    all_x_vals.append(vals['cmax'])
     x_min = min(all_x_vals) * 0.88
     x_max = max(all_x_vals) * 1.10
 
@@ -355,6 +382,34 @@ def plot_scatter(baselines: Dict,
                                 alpha=0.4, lw=0.6),
             )
 
+    # ── Bi-level methods (diamond markers) ────────────────────────────────
+    if bi_level:
+        BI_MARKERS = {'SPT': 'D', 'FIFO': 'D', 'WINQ': 'D'}
+        for rule_name in ['SPT', 'FIFO', 'WINQ']:
+            if rule_name not in bi_level:
+                continue
+            bi_data = bi_level[rule_name]
+            marker = BI_MARKERS[rule_name]
+            for t_str, vals in bi_data.items():
+                t = float(t_str)
+                x = vals['cmax']
+                y_ms = vals['compute_time'] * 1000.0
+
+                color = TIME_COLORS[t]
+                ax.scatter(x, y_ms, c=color, marker=marker, s=140,
+                           edgecolors='black', linewidth=1.2, zorder=4)
+
+                ax.annotate(
+                    f"{rule_name}-MILP  t={t:.0f}",
+                    (x, y_ms),
+                    textcoords="offset points",
+                    xytext=(8, -12),
+                    fontsize=7.0,
+                    alpha=0.85,
+                    arrowprops=dict(arrowstyle='->', color='gray',
+                                    alpha=0.4, lw=0.6),
+                )
+
     # ── Axis setup ──────────────────────────────────────────────────────
     ax.set_xlabel('Makespan  (C_max)  [hours]', fontsize=13)
     ax.set_xlim(x_min, x_max)
@@ -387,7 +442,11 @@ def plot_scatter(baselines: Dict,
                label='FIFO'),
         Line2D([0], [0], marker=RULE_MARKERS['WINQ'], color='w',
                markerfacecolor='#555555', markersize=9,
-               label='WINQ'),
+               label='WINQ  (single-level)'),
+        Line2D([], [], color='none', label=''),   # spacer
+        Line2D([0], [0], marker='D', color='w',
+               markerfacecolor='#333333', markersize=10,
+               label='SPT/FIFO/WINQ-MILP  (bi-level)'),
         Line2D([], [], color='none', label=''),   # spacer
         Line2D([0], [0], marker=BASELINE_MARKER, color='w',
                markerfacecolor=TIME_COLORS[0.0], markersize=14,
@@ -435,6 +494,9 @@ def main():
     print("Loading baseline data ...")
     baselines = load_baseline_data()
 
+    print("Loading bi-level data ...")
+    bi_level = load_bi_level_data()
+
     # Print summary table
     print("\n" + "=" * 60)
     print("  Data summary")
@@ -445,6 +507,14 @@ def main():
             print(f"  {rule_name:6s}  t={float(t_str):.0f}  "
                   f"cmax={d['cmax']:6.1f}  "
                   f"compute={d['compute_time']*1000:8.3f} ms")
+    if bi_level:
+        for rule_name in ['SPT', 'FIFO', 'WINQ']:
+            if rule_name in bi_level:
+                for t_str in ['0.0', '2.0', '6.0']:
+                    d = bi_level[rule_name][t_str]
+                    print(f"  {rule_name + '-MILP':6s}  t={float(t_str):.0f}  "
+                          f"cmax={d['cmax']:6.1f}  "
+                          f"compute={d['compute_time']*1000:8.3f} ms")
     for key in ['A', 'B', 'C']:
         b = baselines[key]
         ct_str = f"{b['compute_time']*1000:8.3f} ms" if b.get('compute_time') else "N/A"
@@ -453,7 +523,7 @@ def main():
               f"compute={ct_str}")
     print("-" * 60)
 
-    plot_scatter(baselines, rules, log_y=True)
+    plot_scatter(baselines, rules, bi_level, log_y=True)
 
 
 if __name__ == "__main__":
