@@ -18,6 +18,8 @@ OUTPUT_DIR = os.path.join(_HERE, "output")
 BASELINE_CACHE = os.path.join(OUTPUT_DIR, "baseline_results.json")
 RULE_CACHE = os.path.join(OUTPUT_DIR, "pure_rule_results.json")
 BI_LEVEL_CACHE = os.path.join(OUTPUT_DIR, "bi_level_results.json")
+GA_GLOBAL_CACHE = os.path.join(OUTPUT_DIR, "ga_global_results.json")
+GA_BI_LEVEL_CACHE = os.path.join(OUTPUT_DIR, "ga_bi_level_results.json")
 
 
 def fmt_pct(v: float) -> str:
@@ -145,6 +147,81 @@ def main():
                 "interrupted_jobs": affected_jobs_s2,
             }
 
+    # -- Global GA metrics ---------------------------------------------------
+    ga_global_data = {}
+    if os.path.exists(GA_GLOBAL_CACHE):
+        with open(GA_GLOBAL_CACHE, "r", encoding="utf-8") as f:
+            gga_raw = json.load(f)
+        gga = gga_raw.get("global_ga", gga_raw)
+        if all(k in gga for k in ["0.0", "2.0", "6.0"]):
+            cmax_t0 = gga["0.0"]["cmax"]
+            cmax_t2 = gga["2.0"]["cmax"]
+            cmax_t6 = gga["6.0"]["cmax"]
+
+            deg1 = (cmax_t2 - cmax_t0) / cmax_t0 * 100
+            deg2 = (cmax_t6 - cmax_t2) / cmax_t2 * 100
+            excess_deg1 = deg1 - bl_deg1
+            excess_deg2 = deg2 - bl_deg2
+
+            entries_t0 = gga["0.0"]["entries"]
+            entries_t2 = gga["2.0"]["entries"]
+            entries_t6 = gga["6.0"]["entries"]
+
+            affected_ops_s1, affected_jobs_s1 = count_machine_changes(
+                entries_t0, entries_t2)
+            affected_ops_s2, affected_jobs_s2 = count_machine_changes(
+                entries_t2, entries_t6)
+
+            ga_global_data = {
+                "deg1": deg1,
+                "deg2": deg2,
+                "excess_deg1": excess_deg1,
+                "excess_deg2": excess_deg2,
+                "affected_ops_s1": affected_ops_s1,
+                "affected_jobs_s1": affected_jobs_s1,
+                "interrupted_ops": affected_ops_s2,
+                "interrupted_jobs": affected_jobs_s2,
+            }
+
+    # -- Bi-level GA metrics --------------------------------------------------
+    ga_bi_level_data = {}
+    if os.path.exists(GA_BI_LEVEL_CACHE):
+        with open(GA_BI_LEVEL_CACHE, "r", encoding="utf-8") as f:
+            ga_bi_raw = json.load(f)
+        for rule_name in ["SPT", "FIFO", "WINQ"]:
+            if rule_name not in ga_bi_raw.get("rules", {}):
+                continue
+            r = ga_bi_raw["rules"][rule_name]
+            cmax_t0 = r["snapshot_cmax"]["0.0"]
+            cmax_t2 = r["snapshot_cmax"]["2.0"]
+            cmax_t6 = r["snapshot_cmax"]["6.0"]
+
+            deg1 = (cmax_t2 - cmax_t0) / cmax_t0 * 100
+            deg2 = (cmax_t6 - cmax_t2) / cmax_t2 * 100
+            excess_deg1 = deg1 - bl_deg1
+            excess_deg2 = deg2 - bl_deg2
+
+            ss = r.get("snapshot_schedules", {})
+            entries_t0 = ss.get("0.0", [])
+            entries_t2 = ss.get("2.0", [])
+            entries_t6 = ss.get("6.0", [])
+
+            affected_ops_s1, affected_jobs_s1 = count_machine_changes(
+                entries_t0, entries_t2)
+            affected_ops_s2, affected_jobs_s2 = count_machine_changes(
+                entries_t2, entries_t6)
+
+            ga_bi_level_data[rule_name] = {
+                "deg1": deg1,
+                "deg2": deg2,
+                "excess_deg1": excess_deg1,
+                "excess_deg2": excess_deg2,
+                "affected_ops_s1": affected_ops_s1,
+                "affected_jobs_s1": affected_jobs_s1,
+                "interrupted_ops": affected_ops_s2,
+                "interrupted_jobs": affected_jobs_s2,
+            }
+
     # =====================================================================
     #  Build the table
     # =====================================================================
@@ -213,6 +290,35 @@ def main():
             )
             lines.append(rl)
 
+    # -- Global GA row -------------------------------------------------------
+    if ga_global_data:
+        lines.append("")  # blank spacer before GA section
+        d = ga_global_data
+        rl = (
+            f"{'Global GA':10s}{SEP}"
+            f"{fmt_pct(d['deg1']):>8s}  {d['affected_ops_s1']:>8d}  "
+            f"{d['affected_jobs_s1']:>8d}  {fmt_pct(d['excess_deg1']):>8s}{SEP}"
+            f"{fmt_pct(d['deg2']):>8s}  {d['interrupted_ops']:>8d}  "
+            f"{d['interrupted_jobs']:>8d}  {fmt_pct(d['excess_deg2']):>8s}"
+        )
+        lines.append(rl)
+
+    # -- Bi-level GA rows ----------------------------------------------------
+    if ga_bi_level_data:
+        lines.append("")
+        for rule_name in ["SPT", "FIFO", "WINQ"]:
+            if rule_name not in ga_bi_level_data:
+                continue
+            d = ga_bi_level_data[rule_name]
+            rl = (
+                f"{rule_name + '-GA':10s}{SEP}"
+                f"{fmt_pct(d['deg1']):>8s}  {d['affected_ops_s1']:>8d}  "
+                f"{d['affected_jobs_s1']:>8d}  {fmt_pct(d['excess_deg1']):>8s}{SEP}"
+                f"{fmt_pct(d['deg2']):>8s}  {d['interrupted_ops']:>8d}  "
+                f"{d['interrupted_jobs']:>8d}  {fmt_pct(d['excess_deg2']):>8s}"
+            )
+            lines.append(rl)
+
     lines.append(HL)
     lines.append("")
 
@@ -227,16 +333,18 @@ def main():
         f"(Baseline: cmax {cmax_B:.0f}h -> {cmax_C:.0f}h with M3 breakdown)"
     )
 
-    # Best/worst per stage (single-level rules only)
+    # Best/worst per stage
     for label, dkey in [("Stage 1 (J9+J10)", "excess_deg1"),
                          ("Stage 2 (M3 breakdown)", "excess_deg2")]:
+        # Single-level rules
         vals = [(rules_data[r][dkey], r) for r in ["SPT", "FIFO", "WINQ"]]
         best = min(vals, key=lambda x: x[0])
         worst = max(vals, key=lambda x: x[0])
         lines.append(
-            f"  {label} (single-level):  most resilient = {best[1]} ({fmt_pct(best[0])}),  "
+            f"  {label} (single-level rules):  most resilient = {best[1]} ({fmt_pct(best[0])}),  "
             f"most fragile = {worst[1]} ({fmt_pct(worst[0])})"
         )
+        # Bi-level MILP
         if bi_level_data:
             bl_vals = [(bi_level_data[r][dkey], r + '-MILP')
                        for r in ["SPT", "FIFO", "WINQ"] if r in bi_level_data]
@@ -244,8 +352,25 @@ def main():
                 bl_best = min(bl_vals, key=lambda x: x[0])
                 bl_worst = max(bl_vals, key=lambda x: x[0])
                 lines.append(
-                    f"  {label} (bi-level):      most resilient = {bl_best[1]} ({fmt_pct(bl_best[0])}),  "
+                    f"  {label} (bi-level MILP):      most resilient = {bl_best[1]} ({fmt_pct(bl_best[0])}),  "
                     f"most fragile = {bl_worst[1]} ({fmt_pct(bl_worst[0])})"
+                )
+        # Global GA
+        if ga_global_data:
+            ga_val = ga_global_data[dkey]
+            lines.append(
+                f"  {label} (Global GA):            excess = {fmt_pct(ga_val)}"
+            )
+        # Bi-level GA
+        if ga_bi_level_data:
+            ga_vals = [(ga_bi_level_data[r][dkey], r + '-GA')
+                       for r in ["SPT", "FIFO", "WINQ"] if r in ga_bi_level_data]
+            if ga_vals:
+                ga_best = min(ga_vals, key=lambda x: x[0])
+                ga_worst = max(ga_vals, key=lambda x: x[0])
+                lines.append(
+                    f"  {label} (bi-level GA):         most resilient = {ga_best[1]} ({fmt_pct(ga_best[0])}),  "
+                    f"most fragile = {ga_worst[1]} ({fmt_pct(ga_worst[0])})"
                 )
 
     lines.append("")

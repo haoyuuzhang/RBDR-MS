@@ -19,12 +19,22 @@ WINQ         +13.79%        16         7   +13.79%   +15.15%        19         9
 SPT-MILP      +7.14%         9         5    +7.14%   +26.67%         9         5   +19.52%
 FIFO-MILP    +35.71%        23         8   +35.71%   +31.58%        11         7   +24.44%
 WINQ-MILP    +71.43%        27         7   +71.43%   +12.50%        15         7    +5.36%
+
+Global GA    +20.00%         1         1   +20.00%     0.00%         2         2    -7.14%
+
+SPT-GA        -7.14%         5         4    -7.14%   +30.77%         4         4   +23.63%
+FIFO-GA      +35.71%        11         8   +35.71%   +15.79%         4         4    +8.65%
+WINQ-GA      +35.71%        16         8   +35.71%   +15.79%         4         4    +8.65%
 ------------------------------------------------------------------------------------------------------------------------
 
 Notes:
   Optimal Stage-1 degradation:  0.00%  (Baseline: cmax 14h -> 14h with J9/J10)
   Optimal Stage-2 degradation: +7.14%  (Baseline: cmax 14h -> 15h with M3 breakdown)
-  Stage 1 (J9+J10) (single-level):  most resilient = FIFO (-16.22%),  most fragile = WINQ (+13.79%)
-  Stage 1 (J9+J10) (bi-level):      most resilient = SPT-MILP (+7.14%),  most fragile = WINQ-MILP (+71.43%)
-  Stage 2 (M3 breakdown) (single-level):  most resilient = SPT (-7.14%),  most fragile = FIFO (+18.66%)
-  Stage 2 (M3 breakdown) (bi-level):      most resilient = WINQ-MILP (+5.36%),  most fragile = FIFO-MILP (+24.44%)
+  Stage 1 (J9+J10) (single-level rules):  most resilient = FIFO (-16.22%),  most fragile = WINQ (+13.79%)
+  Stage 1 (J9+J10) (bi-level MILP):      most resilient = SPT-MILP (+7.14%),  most fragile = WINQ-MILP (+71.43%)
+  Stage 1 (J9+J10) (Global GA):            excess = +20.00%
+  Stage 1 (J9+J10) (bi-level GA):         most resilient = SPT-GA (-7.14%),  most fragile = FIFO-GA (+35.71%)
+  Stage 2 (M3 breakdown) (single-level rules):  most resilient = SPT (-7.14%),  most fragile = FIFO (+18.66%)
+  Stage 2 (M3 breakdown) (bi-level MILP):      most resilient = WINQ-MILP (+5.36%),  most fragile = FIFO-MILP (+24.44%)
+  Stage 2 (M3 breakdown) (Global GA):            excess = -7.14%
+  Stage 2 (M3 breakdown) (bi-level GA):         most resilient = FIFO-GA (+8.65%),  most fragile = SPT-GA (+23.63%)

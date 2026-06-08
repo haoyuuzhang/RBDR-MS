@@ -379,6 +379,11 @@ def simulate_bi_level(
     """
     t_start_total = time.perf_counter()
 
+    # Track per-stage compute times
+    dt_stage_0 = 0.0   # t=0 global solve
+    dt_stage_1 = 0.0   # t=2 bi-level
+    dt_stage_2 = 0.0   # t=6 bi-level
+
     job_map: Dict[int, Job] = {j.job_id: j for j in jobs}
     initial_jobs = [j for j in jobs if j.arrival_time <= 0.0]
 
@@ -412,6 +417,7 @@ def simulate_bi_level(
             return None
 
     cmax_0 = max(e.end_time for e in sched_0)
+    dt_stage_0 = dt0
     print(f"    OK  C_max = {cmax_0:.3f}  (solve time {dt0:.1f} s)")
 
     # Mark all t=0 entries as the baseline
@@ -421,6 +427,7 @@ def simulate_bi_level(
     # ═══════════════════════════════════════════════════════════════════════
     #  Stage 1: t=2 — J9/J10 arrive, bi-level re-scheduling
     # ═══════════════════════════════════════════════════════════════════════
+    t_stage_1_start = time.perf_counter()
     t_event = 2.0
     print(f"\n  [{rule_name}] Stage 1 — t={t_event:.0f}  Bi-level re-scheduling  "
           f"(J9, J10 arrive) ...")
@@ -566,10 +573,12 @@ def simulate_bi_level(
     print(f"    Combined C_max = {cmax_2:.3f}")
 
     snapshot_schedules['2.0'] = sched_2_all
+    dt_stage_1 = time.perf_counter() - t_stage_1_start
 
     # ═══════════════════════════════════════════════════════════════════════
     #  Stage 2: t=6 — M3 breakdown, bi-level re-scheduling
     # ═══════════════════════════════════════════════════════════════════════
+    t_stage_2_start = time.perf_counter()
     t_event = 6.0
 
     # Find the disruption info
@@ -755,6 +764,7 @@ def simulate_bi_level(
     print(f"    Combined C_max = {cmax_6:.3f}")
 
     snapshot_schedules['6.0'] = sched_6_all
+    dt_stage_2 = time.perf_counter() - t_stage_2_start
 
     # ── Assemble final result ──────────────────────────────────────────────
     total_compute = time.perf_counter() - t_start_total
@@ -783,6 +793,11 @@ def simulate_bi_level(
         'entries': serialised_entries,
         'partial_entries': serialised_partial,
         'compute_time': total_compute,
+        'stage_times': {
+            '0.0': dt_stage_0,
+            '2.0': dt_stage_1,
+            '6.0': dt_stage_2,
+        },
         'unit_assignments': serialised_assignments,
         'snapshot_schedules': serialised_snapshots,
         'snapshot_cmax': {

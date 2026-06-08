@@ -15,7 +15,6 @@ Output
   output/fig_bi_level_gantt_spt.png     — SPT-MILP snapshot Gantt
   output/fig_bi_level_gantt_fifo.png    — FIFO-MILP snapshot Gantt
   output/fig_bi_level_gantt_winq.png    — WINQ-MILP snapshot Gantt
-  output/fig_bi_level_scatter.png       — comparison scatter plot
 
 Usage
 -----
@@ -424,163 +423,6 @@ def plot_results(results: dict) -> None:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  Comparison scatter plot
-# ═════════════════════════════════════════════════════════════════════════════
-
-def plot_comparison(results: dict) -> None:
-    """Scatter plot: bi-level vs single-level rules vs Gurobi baselines."""
-    # ── Load existing data ─────────────────────────────────────────────────
-    bl_data: dict = {}
-    if os.path.exists(BASELINE_CACHE):
-        with open(BASELINE_CACHE, "r", encoding="utf-8") as f:
-            bl_raw = json.load(f)
-        for key in ["A", "B", "C"]:
-            bl = bl_raw["baselines"][key]
-            bl_data[key] = {"cmax": bl["cmax"],
-                            "compute_time": bl.get("compute_time", None)}
-
-    rule_data: dict = {}
-    if os.path.exists(RULE_CACHE):
-        with open(RULE_CACHE, "r", encoding="utf-8") as f:
-            rule_raw = json.load(f)
-        for rn in ["SPT", "FIFO", "WINQ"]:
-            rule_data[rn] = {}
-            for t_str in ["0.0", "2.0", "6.0"]:
-                sim = rule_raw["rules"][rn][t_str]
-                rule_data[rn][t_str] = {
-                    "cmax": sim["cmax"],
-                    "compute_time": sim["compute_time"],
-                }
-
-    # ── Colours & markers ──────────────────────────────────────────────────
-    TIME_COLORS = {0.0: '#2196F3', 2.0: '#FF9800', 6.0: '#4CAF50'}
-    RULE_MARKERS = {'SPT': 'o', 'FIFO': 's', 'WINQ': '^'}
-    BI_MARKERS = {'SPT': 'D', 'FIFO': 'D', 'WINQ': 'D'}  # diamond for bi-level
-    BASELINE_MARKER = '*'
-    BASELINE_TIME_MAP = {'A': 0.0, 'B': 2.0, 'C': 6.0}
-
-    # ── Compute ranges ────────────────────────────────────────────────────
-    all_x = []
-    for rn in ["SPT", "FIFO", "WINQ"]:
-        for vals in rule_data.get(rn, {}).values():
-            all_x.append(vals["cmax"])
-        if rn in results["rules"]:
-            r = results["rules"][rn]
-            for t in SNAPSHOT_TIMES:
-                all_x.append(r["snapshot_cmax"][str(t)])
-    for bl in bl_data.values():
-        all_x.append(bl["cmax"])
-    x_min = min(all_x) * 0.88
-    x_max = max(all_x) * 1.10
-
-    # ═══════════════════════════════════════════════════════════════════════
-    #  Figure
-    # ═══════════════════════════════════════════════════════════════════════
-    fig, ax = plt.subplots(figsize=(14, 8))
-
-    # ── Gurobi baselines (stars) ─────────────────────────────────────────
-    bl_labels = {
-        'A': 'Baseline A\n(t=0, J1-J8)',
-        'B': 'Baseline B\n(t=0 clairvoyant, J1-J10)',
-        'C': 'Baseline C\n(t=0 clairvoyant, +M3)',
-    }
-    for key in ['A', 'B', 'C']:
-        bl = bl_data[key]
-        x = bl['cmax']
-        t_ref = BASELINE_TIME_MAP[key]
-        ct = bl.get('compute_time')
-        if ct is not None:
-            y_ms = ct * 1000.0
-        else:
-            y_ms = 200.0  # placeholder
-        ax.scatter(x, y_ms, c=TIME_COLORS[t_ref], marker=BASELINE_MARKER, s=350,
-                   edgecolors='black', linewidth=1.5, zorder=5)
-        ct_str = f"{ct*1000:.0f} ms" if ct else "N/A"
-        ax.annotate(
-            f"{bl_labels[key]}\nC_max={x:.1f}, {ct_str}",
-            (x, y_ms), textcoords="offset points", xytext=(10, 8),
-            fontsize=7.5, fontweight='bold',
-            arrowprops=dict(arrowstyle='->', color='gray', alpha=0.6, lw=0.8),
-        )
-
-    # ── Single-level rules (hollow markers) ──────────────────────────────
-    for rn in ['SPT', 'FIFO', 'WINQ']:
-        marker = RULE_MARKERS[rn]
-        for t_str, vals in rule_data.get(rn, {}).items():
-            t = float(t_str)
-            x = vals['cmax']
-            y_ms = vals['compute_time'] * 1000.0
-            ax.scatter(x, y_ms, c='none', edgecolors=TIME_COLORS[t],
-                       marker=marker, s=100, linewidth=1.2, zorder=3,
-                       label='_' * 20)  # hide from legend
-
-    # ── Bi-level rules (filled diamonds) ─────────────────────────────────
-    for rn in ['SPT', 'FIFO', 'WINQ']:
-        if rn not in results["rules"]:
-            continue
-        r = results["rules"][rn]
-        for t in SNAPSHOT_TIMES:
-            t_str = str(t)
-            if t_str in r["snapshot_cmax"]:
-                x = r["snapshot_cmax"][t_str]
-            else:
-                x = r["cmax"]
-            y_ms = r['compute_time'] * 1000.0
-            color = TIME_COLORS[t]
-            ax.scatter(x, y_ms, c=color, marker='D', s=140,
-                       edgecolors='black', linewidth=1.2, zorder=4)
-            ax.annotate(
-                f"{rn}-MILP  t={t:.0f}",
-                (x, y_ms), textcoords="offset points", xytext=(8, -12),
-                fontsize=7.0, alpha=0.85,
-                arrowprops=dict(arrowstyle='->', color='gray', alpha=0.4, lw=0.6),
-            )
-
-    # ── Axis setup ────────────────────────────────────────────────────────
-    ax.set_xlabel('Makespan  (C_max)  [hours]', fontsize=13)
-    ax.set_ylabel('Computation Time  [ms]  (log scale)', fontsize=13)
-    ax.set_xlim(x_min, x_max)
-    ax.set_yscale('log')
-    ax.grid(True, alpha=0.25, linestyle='--')
-
-    # ── Legend ────────────────────────────────────────────────────────────
-    from matplotlib.lines import Line2D
-    legend_elements = [
-        Line2D([0], [0], marker='o', color='w', markerfacecolor=TIME_COLORS[0.0],
-               markersize=10, label='t = 0  (initial jobs)'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor=TIME_COLORS[2.0],
-               markersize=10, label='t = 2  (+J9, J10 arrive)'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor=TIME_COLORS[6.0],
-               markersize=10, label='t = 6  (+M3 breakdown)'),
-        Line2D([], [], color='none', label=''),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='#888888',
-               markersize=9, markeredgecolor='#888888', label='Single-level SPT'),
-        Line2D([0], [0], marker='s', color='w', markerfacecolor='#888888',
-               markersize=9, markeredgecolor='#888888', label='Single-level FIFO'),
-        Line2D([0], [0], marker='^', color='w', markerfacecolor='#888888',
-               markersize=9, markeredgecolor='#888888', label='Single-level WINQ'),
-        Line2D([], [], color='none', label=''),
-        Line2D([0], [0], marker='D', color='w', markerfacecolor='#555555',
-               markersize=9, label='Bi-level (SPT/FIFO/WINQ-MILP)'),
-        Line2D([], [], color='none', label=''),
-        Line2D([0], [0], marker='*', color='w', markerfacecolor='#333333',
-               markersize=14, label='Gurobi Baseline'),
-    ]
-    ax.legend(handles=legend_elements, loc='upper right', fontsize=8,
-              title=' Legend', title_fontsize=10, framealpha=0.85, ncol=1)
-
-    ax.set_title(
-        'FJSP Comparison:  Makespan vs Computation Time\n'
-        'Kacem 8×8  —  Gurobi Baselines  ·  Single-Level Rules  ·  Bi-Level (Rule+MILP)',
-        fontsize=14, fontweight='bold', pad=12)
-
-    out_path = os.path.join(OUTPUT_DIR, "fig_bi_level_scatter.png")
-    fig.savefig(out_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Scatter plot saved →  {out_path}")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
 #  Main
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -590,7 +432,6 @@ def main():
         print("ERROR: Bi-level experiments failed.", file=sys.stderr)
         sys.exit(1)
     plot_results(results)
-    plot_comparison(results)
     print("\nDone.")
 
 
